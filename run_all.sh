@@ -11,11 +11,16 @@
 #      network volume, enough free disk for all three models + FLORES + results
 #   2. Installs dependencies
 #   3. Pre-fetches all three models' weights via scripts/prefetch_model.py,
-#      which is hardened against the download hangs/failures hit on
-#      2026-07-03 (hard per-attempt timeout + kill + retry, single-connection
-#      transfer mode) — this is what makes the run "unattended-safe": a
-#      stalled download gets killed and retried automatically instead of
-#      silently hanging forever with nobody watching.
+#      which downloads files with plain curl subprocesses rather than
+#      huggingface_hub's own downloader. On 2026-07-03, huggingface_hub's
+#      downloader (both its xet backend and its standard HTTP backend) hung
+#      indefinitely with no exception on TWO different models' first shard,
+#      while curl to the identical URLs succeeded — so this bypasses
+#      huggingface_hub's download machinery entirely and builds the local
+#      HF cache directory by hand (see prefetch_model.py's docstring for
+#      exactly how). Each file download runs under a hard timeout + retry,
+#      so a stuck transfer gets killed and resumed rather than hanging
+#      forever with nobody watching.
 #   4. Runs the actual pipeline (olmoe -> qwen_moe -> deepseek_moe)
 #
 # Does NOT use Docker by default (faster to iterate on a rented pod that
@@ -33,6 +38,13 @@ export HF_HUB_DISABLE_XET=1
 
 echo "=== [1/4] Environment checks ==="
 python3 --version
+
+if ! command -v curl > /dev/null 2>&1; then
+    echo "FATAL: curl not found. scripts/prefetch_model.py requires it (huggingface_hub's" >&2
+    echo "own downloader was unreliable on the pod this was developed against — see" >&2
+    echo "prefetch_model.py's docstring). Install curl before continuing." >&2
+    exit 1
+fi
 
 if ! nvidia-smi > /dev/null 2>&1; then
     echo "FATAL: no GPU visible. This pipeline requires a GPU (tested against a single 24GB RTX 4090)." >&2

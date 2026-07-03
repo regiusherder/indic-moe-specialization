@@ -1,23 +1,29 @@
 #!/usr/bin/env python
 """Pre-download a model's weights into the HF cache BEFORE the main pipeline
-runs, using huggingface_hub's snapshot_download with settings tuned for flaky
-large-file transfers, wrapped in a hard per-attempt timeout + retry loop.
+runs, using plain curl subprocesses instead of huggingface_hub's downloader.
 
-Why this exists: on a RunPod RTX 4090 pod (2026-07-03), model downloads
-through both huggingface_hub's "xet" fast-download backend AND its standard
-HTTP backend either failed with an exception mid-shard OR — the harder case —
-hung indefinitely with NO exception and NO progress, surviving Ctrl+C, while
-a plain `curl` to the identical URL succeeded (slowly). A try/except retry
-loop cannot recover from the hang case: nothing is ever raised, so the
-except branch never fires and the process just sits there forever.
+Why this exists: on a RunPod RTX 4090 pod (2026-07-03), huggingface_hub's
+downloader — both its "xet" fast-download backend AND its standard HTTP
+backend — hung indefinitely with NO exception (survived Ctrl+C, needed
+Ctrl+Z + kill -9) on TWO DIFFERENT models' first shard, stuck at 0% with no
+progress. A direct `curl` to the identical file URLs succeeded both times
+(slowly, ~5-10 MB/s, but making real progress). This pointed at
+huggingface_hub's download machinery itself (connection pooling / retry
+logic / xet client) misbehaving on this pod's network, not the network
+being down. The fix: stop using huggingface_hub's downloader entirely and
+build the local HF cache directory by hand with curl.
 
-The fix: run each attempt in a SEPARATE PROCESS under a hard wall-clock
-timeout. If an attempt exceeds the timeout, it is killed (SIGKILL, no
-possibility of it swallowing SIGINT/SIGTERM the way the interactive hang
-did) and the next attempt starts fresh. snapshot_download()'s own file-level
-resume means a killed attempt doesn't lose completed shards — the next
-attempt picks up mid-download. Combined with `max_workers=1`, this mimics
-the single-connection behavior that worked reliably via curl.
+How it works: this script (1) lists a repo's files via the small, fast HF
+API `GET /api/models/{repo_id}` call (JSON, not the large-file path), then
+(2) curls each file directly into
+`~/.cache/huggingface/hub/models--{org}--{name}/snapshots/main/{filename}`.
+huggingface_hub's cache resolution only checks that this path exists — it
+does not require the blobs/ + symlink structure it creates itself, and
+falls back to treating the revision string literally as the snapshot
+folder name when no `refs/{revision}` file is present. Once cached this
+way, `from_pretrained(repo_id)` finds everything locally with zero
+network calls (verified against huggingface_hub's cache resolution logic,
+2026-07-03).
 
 Usage:
     python scripts/prefetch_model.py --model olmoe
@@ -28,107 +34,101 @@ Usage:
 Called automatically by run_all.sh before the main pipeline starts.
 """
 import argparse
+import json
 import os
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
-
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Per-attempt wall-clock budget. Generous enough for a genuinely slow (but
-# progressing) transfer of the largest shard in this study's models
-# (~8-9GB) even at the ~5-10 MB/s "slow but happening" rate observed via
-# curl on the flaky pod, with margin — this is a timeout for STALLS, not a
-# realistic-speed budget, so err high rather than killing a slow-but-working
-# transfer.
-ATTEMPT_TIMEOUT_SECONDS = 45 * 60
-MAX_ATTEMPTS = 6
+CURL_TIMEOUT_SECONDS = 45 * 60  # per-file hard wall-clock budget
+MAX_ATTEMPTS_PER_FILE = 4
+
+HF_HOME = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+HF_HUB_CACHE = Path(os.environ.get("HF_HUB_CACHE", HF_HOME / "hub"))
 
 
-def _worker_snippet(hf_id: str, revision: str | None) -> str:
-    """Source for the single-shot child process: try ONE snapshot_download
-    call and exit. Runs in its own process so the parent can SIGKILL it on
-    a timeout regardless of what the download call is doing internally."""
-    return f"""
-import os
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id={hf_id!r},
-    revision={revision!r},
-    max_workers=1,
-    etag_timeout=30,
-)
-print("PREFETCH_OK")
-"""
+def cache_dir_for(hf_id: str) -> Path:
+    org_name = hf_id.replace("/", "--")
+    return HF_HUB_CACHE / f"models--{org_name}"
 
 
-def prefetch(hf_id: str, revision: str | None):
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        print(f"[{hf_id}] attempt {attempt}/{MAX_ATTEMPTS} "
-              f"(revision={revision or 'main'}, timeout={ATTEMPT_TIMEOUT_SECONDS}s) ...")
+def list_repo_files(hf_id: str, revision: str | None) -> list[str]:
+    """Small, fast metadata call — not the large-file download path that hangs."""
+    ref = revision or "main"
+    url = f"https://huggingface.co/api/models/{hf_id}?revision={ref}"
+    print(f"[{hf_id}] listing files via {url} ...")
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        data = json.loads(resp.read())
+    files = [s["rfilename"] for s in data.get("siblings", [])]
+    if not files:
+        raise RuntimeError(f"[{hf_id}] API returned no file list — check the repo ID and revision.")
+    print(f"[{hf_id}] {len(files)} files found: {files}")
+    return files
+
+
+def curl_file(url: str, dest: Path) -> bool:
+    """Returns True on success. Uses curl -C - for resume-on-retry (partial
+    files from a killed/timed-out attempt are continued, not restarted)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dest = dest.with_suffix(dest.suffix + ".partial")
+
+    for attempt in range(1, MAX_ATTEMPTS_PER_FILE + 1):
+        print(f"    attempt {attempt}/{MAX_ATTEMPTS_PER_FILE}: curl -> {dest.name}")
         try:
             result = subprocess.run(
-                [sys.executable, "-c", _worker_snippet(hf_id, revision)],
-                timeout=ATTEMPT_TIMEOUT_SECONDS,
-                cwd=REPO_ROOT,
+                ["curl", "-L", "--fail", "--retry", "3", "--retry-delay", "5",
+                 "-C", "-",  # resume partial download if tmp_dest already exists
+                 "-o", str(tmp_dest), url],
+                timeout=CURL_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            print(f"[{hf_id}] attempt {attempt} HUNG past {ATTEMPT_TIMEOUT_SECONDS}s — "
-                  f"killed. Retrying (already-downloaded shards are NOT lost, "
-                  f"snapshot_download resumes them).")
+            print(f"    attempt {attempt} exceeded {CURL_TIMEOUT_SECONDS}s — killed, retrying "
+                  f"(curl -C - resumes from where this attempt left off, not from scratch)")
             continue
 
         if result.returncode == 0:
-            print(f"[{hf_id}] prefetch succeeded on attempt {attempt}.")
-            return
-        print(f"[{hf_id}] attempt {attempt} exited with code {result.returncode} — retrying.")
-        if attempt < MAX_ATTEMPTS:
-            backoff = min(20 * attempt, 120)
-            print(f"[{hf_id}] waiting {backoff}s before retry...")
-            time.sleep(backoff)
+            tmp_dest.rename(dest)
+            return True
+        print(f"    curl exited {result.returncode} — retrying")
+        time.sleep(min(10 * attempt, 60))
 
-    raise RuntimeError(
-        f"[{hf_id}] failed to download after {MAX_ATTEMPTS} attempts. "
-        f"This is the same failure pattern that forced the DeepSeek-V2-Lite -> "
-        f"deepseek-moe-16b-base swap (see README) — if this keeps happening for "
-        f"a DIFFERENT model, the problem is this pod's network, not the specific "
-        f"HF repo. Consider a different RunPod region/pod, or run "
-        f"`curl -L -o /tmp/test.bin <a large file URL from this repo>` to confirm "
-        f"raw connectivity before retrying the pipeline."
-    )
+    return False
 
 
-def check_not_on_network_volume():
-    """RunPod separates container disk (fast, per-pod) from an optional
-    mounted network volume (shared, quota-limited, e.g. /workspace on some
-    pods). Downloading multi-GB model weights onto the network volume by
-    accident — because the repo was cloned there — caused a
-    'Disk quota exceeded' error on 2026-07-03 even though the container's
-    own disk was almost empty. Fail loudly here rather than silently eating
-    hours of download time before hitting the same quota wall."""
-    cwd = Path.cwd()
-    try:
-        result = subprocess.run(["df", str(cwd)], capture_output=True, text=True, timeout=10)
-        output = result.stdout
-    except Exception:
-        return  # best-effort; don't block a run over a diagnostic that itself failed
+SKIP_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".md", ".gitattributes")
 
-    suspicious_markers = ["mfs#", "nfs", ":/workspace", "runpod-volume"]
-    if any(marker in output for marker in suspicious_markers):
-        print(f"\n{'!'*70}")
-        print(f"WARNING: current directory ({cwd}) appears to be on a network-mounted")
-        print(f"filesystem, not the pod's local container disk:\n{output}")
-        print(f"Network volumes on RunPod are often quota-limited per user even when")
-        print(f"the pool shows huge free space. If downloads fail with 'Disk quota")
-        print(f"exceeded', clone/run this repo from the container's local disk instead")
-        print(f"(commonly /root or / — check with `df -h .` after cd'ing there).")
-        print(f"{'!'*70}\n")
+
+def prefetch(hf_id: str, revision: str | None):
+    files = list_repo_files(hf_id, revision)
+    snapshot_dir = cache_dir_for(hf_id) / "snapshots" / (revision or "main")
+
+    for filename in files:
+        if any(filename.lower().endswith(suf) for suf in SKIP_SUFFIXES):
+            print(f"[{hf_id}] {filename}: skipping (not needed for from_pretrained — logo/readme/gitattributes)")
+            continue
+        dest = snapshot_dir / filename
+        if dest.exists() and dest.stat().st_size > 0:
+            print(f"[{hf_id}] {filename}: already cached ({dest.stat().st_size / 1e6:.1f} MB), skipping")
+            continue
+        url = f"https://huggingface.co/{hf_id}/resolve/{revision or 'main'}/{filename}"
+        ok = curl_file(url, dest)
+        if not ok:
+            raise RuntimeError(
+                f"[{hf_id}] failed to download {filename} after {MAX_ATTEMPTS_PER_FILE} attempts via curl. "
+                f"Since curl (not huggingface_hub) is now the download path, a failure here means a "
+                f"genuine network problem to huggingface.co from this pod — test with: "
+                f"curl -o /dev/null -w '%{{http_code}} %{{speed_download}}\\n' -L {url}"
+            )
+        size_mb = dest.stat().st_size / 1e6
+        print(f"[{hf_id}] {filename}: done ({size_mb:.1f} MB)")
+
+    print(f"[{hf_id}] all {len(files)} files cached at {snapshot_dir}")
 
 
 def main():
@@ -139,8 +139,6 @@ def main():
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args()
 
-    check_not_on_network_volume()
-
     config = yaml.safe_load(Path(args.config).read_text())
     models_to_fetch = list(config["models"].keys()) if args.all else [args.model]
 
@@ -148,9 +146,10 @@ def main():
         model_cfg = config["models"][model_key]
         prefetch(model_cfg["hf_id"], model_cfg.get("revision"))
 
-    print("\nAll requested models cached. Running the pipeline now reads from local")
-    print("disk — from_pretrained() will not need the network for these models again")
-    print("unless the cache is deleted.")
+    print("\nAll requested models cached via curl. from_pretrained() will read these")
+    print("files from local disk with no network call, since huggingface_hub's cache")
+    print("resolution only checks that snapshots/{revision}/{filename} exists — it does")
+    print("not require the blobs/+symlink structure it would normally create itself.")
 
 
 if __name__ == "__main__":
