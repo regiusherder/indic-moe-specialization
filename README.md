@@ -79,6 +79,12 @@ warning about `torchvision`/`torchaudio` wanting a different torch version
 than requested — that's expected and harmless (this pipeline uses neither
 package); it's informational, not an error, and does not block the install.
 
+Both `run_all.sh` and `scripts/run_model.py` set `HF_HUB_DISABLE_XET=1`
+automatically — HF Hub's fast "xet" download backend failed reproducibly
+mid-shard downloading DeepSeek-V2-Lite on a RunPod RTX 4090 (same offset,
+two attempts); the standard HTTP downloader doesn't have this problem. You
+don't need to set this yourself.
+
 **Locally (fast iteration, needs a GPU):**
 ```bash
 pip install -r requirements.txt

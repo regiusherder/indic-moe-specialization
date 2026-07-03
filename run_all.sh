@@ -14,6 +14,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# HF Hub's "xet" fast-download backend was observed to fail reproducibly
+# mid-shard on a DeepSeek-V2-Lite download (RunPod RTX 4090, 2026-07-03):
+# "RuntimeError: Internal Writer Error: Failed to send data: receiver
+# dropped" at the same shard/offset on two separate attempts. Disabling it
+# falls back to the standard HTTP downloader, which succeeded immediately.
+# This MUST be set before any transformers/huggingface_hub import happens —
+# an unattended run has nobody to notice a silent hang or retry a crash.
+export HF_HUB_DISABLE_XET=1
+
 echo "=== Environment check ==="
 python3 --version
 nvidia-smi || { echo "No GPU visible — aborting, this pipeline requires a GPU."; exit 1; }

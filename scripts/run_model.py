@@ -10,9 +10,18 @@ Re-running with the same --model after a crash resumes from the last
 completed checkpoint (see src/pipeline.py's stage-by-stage artifact writes).
 """
 import argparse
+import os
 import sys
 import traceback
 from pathlib import Path
+
+# Must be set before transformers/huggingface_hub is imported anywhere
+# (including transitively via src.pipeline -> adapters). The "xet" fast-
+# download backend failed reproducibly mid-shard on DeepSeek-V2-Lite on a
+# RunPod RTX 4090 (2026-07-03) — same offset, two separate attempts. Falling
+# back to the standard HTTP downloader fixed it immediately. run_all.sh also
+# sets this at the shell level, but this covers running this script directly.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 import yaml
 
