@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-"""Runs olmoe -> qwen_moe -> deepseek_v2lite sequentially (fits one 24GB GPU
+"""Runs olmoe -> qwen_moe -> deepseek_moe sequentially (fits one 24GB GPU
 at a time; only one model is ever loaded into memory). If one model's run
 fails, this logs the failure and CONTINUES to the next model rather than
 aborting the whole batch — a bug in the DeepSeek adapter (the least-verified
-of the three, see adapters/deepseek_v2lite.py) shouldn't block OLMoE/Qwen
-results that already succeeded.
+of the three, see adapters/deepseek_moe.py, reused for deepseek-moe-16b-base
+after DeepSeek-V2-Lite's download failed reproducibly) shouldn't block
+OLMoE/Qwen results that already succeeded.
 
 Exit code is non-zero if ANY model failed, so calling infrastructure
 (GitHub Actions, a shell script's `set -e`, cron) can still detect partial failure
@@ -14,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-MODELS = ["olmoe", "qwen_moe", "deepseek_v2lite"]
+MODELS = ["olmoe", "qwen_moe", "deepseek_moe"]
 
 
 def main():

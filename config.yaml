@@ -16,10 +16,18 @@ models:
     revision: null
     adapter: "qwen_moe"
     quantization: "4bit"
-  deepseek_v2lite:
-    hf_id: "deepseek-ai/DeepSeek-V2-Lite"
+  deepseek_moe:
+    # deepseek-moe-16b-base, NOT DeepSeek-V2-Lite. Swapped 2026-07-03 after
+    # V2-Lite's shard 3/4 download failed reproducibly (xet backend errors +
+    # a disk-quota error, on 3 separate pod attempts) — this is the ORIGINAL
+    # DeepSeekMoE paper's model, same architecture family (64 routed experts,
+    # 2 shared experts, top-6, dense layer 0, custom modeling_deepseek.py
+    # with an identical MoEGate returning (topk_idx, topk_weight, aux_loss)),
+    # so src/adapters/deepseek_moe.py's hook logic applies to both models —
+    # only this hf_id needed to change when V2-Lite's download kept failing.
+    hf_id: "deepseek-ai/deepseek-moe-16b-base"
     revision: null
-    adapter: "deepseek_v2lite"
+    adapter: "deepseek_moe"
     quantization: "4bit"
 
 # FLORES-200 language codes with linguistic metadata used for grouping/plots.

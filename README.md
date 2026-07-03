@@ -32,11 +32,26 @@ into a rigorous, unattended, three-model study by fixing four gaps:
    ablation trials per language-family group, so the result can show ablating
    *specific* experts hurts more than ablating *any* experts of the same count.
 4. **Three-model, architecture-aware** — OLMoE (no shared experts), Qwen1.5-MoE
-   (60 routed + 1 shared, verified live), DeepSeek-V2-Lite (64 routed + 2 shared,
-   not yet verified live) each get a dedicated adapter (`src/adapters/`) so
-   shared experts are correctly excluded
-   from specialization analysis, while the JSD/permutation/ablation logic
-   itself stays architecture-agnostic.
+   (60 routed + 1 shared, verified live), deepseek-moe-16b-base (64 routed +
+   2 shared, not yet verified live) each get a dedicated adapter
+   (`src/adapters/`) so shared experts are correctly excluded from
+   specialization analysis, while the JSD/permutation/ablation logic itself
+   stays architecture-agnostic.
+
+## A note on the DeepSeek model swap (2026-07-03)
+
+The study originally targeted **DeepSeek-V2-Lite**, but its download failed
+reproducibly on a rented RunPod pod: shard 3 of 4 failed at the identical
+byte offset across three separate attempts (a "xet" fast-download backend
+error, then — after disabling xet — a disk-quota error even with 119GB
+free). Rather than keep fighting a flaky download path for one specific
+model repo, the study swapped to **`deepseek-ai/deepseek-moe-16b-base`** —
+the original DeepSeekMoE paper's model, and the same architecture family
+V2-Lite represents (fine-grained routed + shared experts, dense first
+layer, identical custom `MoEGate` module returning `(topk_idx, topk_weight,
+aux_loss)`). This satisfies the same research role in the 3-way
+architecture-family comparison; only `config.yaml`'s `hf_id` changed, the
+adapter code (`src/adapters/deepseek_moe.py`) required no logic changes.
 
 ## Before running for real
 
@@ -50,15 +65,17 @@ and its docstring). This doesn't change any ablation/JSD logic — the code
 never touched `shared_expert` either way — but it was wrong metadata that
 would have ended up in a paper.
 
-`src/adapters/deepseek_v2lite.py` is still written against the *documented*
-architecture only (see the Conversation Log) and has **not been executed
-against the live checkpoint**. Before running it for real:
+`src/adapters/deepseek_moe.py` is still written against the *documented*
+architecture only (researched via web search against the model's HF config
+and the DeepSeekMoE GitHub repo — see the file's docstring) and has **not
+been executed against the live checkpoint**. Before running it for real:
 
 ```bash
+export HF_HUB_DISABLE_XET=1   # see the xet note below — set this FIRST
 python -c "
 from transformers import AutoModelForCausalLM
-m = AutoModelForCausalLM.from_pretrained('deepseek-ai/DeepSeek-V2-Lite', trust_remote_code=True, device_map='auto')
-print(m.model.layers[1].mlp)  # layer 0 is dense in V2-Lite
+m = AutoModelForCausalLM.from_pretrained('deepseek-ai/deepseek-moe-16b-base', trust_remote_code=True, device_map='auto')
+print(m.model.layers[1].mlp)  # layer 0 is dense
 "
 ```
 

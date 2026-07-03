@@ -1,18 +1,22 @@
-"""DeepSeek-V2-Lite adapter. DeepSeekMoE architecture: 64 fine-grained routed
-experts (top-6) + 2 shared experts, always active.
+"""DeepSeekMoE-family adapter. Originally written for DeepSeek-V2-Lite, now
+used for deepseek-ai/deepseek-moe-16b-base after DeepSeek-V2-Lite's download
+failed reproducibly on a RunPod pod (shard 3/4 failing identically across
+three attempts — xet backend errors and a disk-quota error; see project log
+2026-07-03). Both models share the same DeepSeekMoE architecture lineage:
+fine-grained routed experts + always-on shared experts, dense first layer,
+custom `modeling_deepseek.py` (requires trust_remote_code=True) with an
+identical MoEGate module.
 
-IMPORTANT — unverified against a live checkpoint, same caveat as qwen_moe.py:
-DeepSeek-V2's HF implementation (`modeling_deepseek.py`, loaded via
-trust_remote_code=True since it is NOT in mainline transformers) exposes
-`.gate` returning `(topk_idx, topk_weight, aux_loss)` per the official repo,
-which is a DIFFERENT return shape than both OLMoE and Qwen. This adapter
-hooks accordingly but MUST be checked against the actual loaded module
-before a real run — trust_remote_code models can change their internals
-between revisions without a version bump.
-
-Action before running for real: load with trust_remote_code=True, print
-`model.model.layers[0].mlp.gate` and inspect its forward signature/return in
-the cached modeling file under the HF cache, and adjust this hook if it drifts.
+Architecture (deepseek-moe-16b-base, per its config.json):
+  n_routed_experts=64, n_shared_experts=2, num_experts_per_tok=6 (top-6),
+  first_k_dense_replace=1 (layer 0 is dense, MoE starts at layer 1).
+NOT executed against a live checkpoint as of this writing — same caveat as
+qwen_moe.py originally carried. Verify before a real run:
+  load with trust_remote_code=True, print `model.model.layers[1].mlp.gate`
+  (layer 0 is dense) and confirm it returns (topk_idx, topk_weight, aux_loss)
+  from a `self.weight` matmul router (no separate nn.Linear `.weight` module
+  wrapper — the hook below applies F.linear using the gate module's own
+  `.weight` parameter directly, matching the official repo's implementation).
 """
 import torch
 import torch.nn.functional as F
@@ -21,8 +25,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from .base import MoEAdapter, RoutingCapture
 
 
-class DeepSeekV2LiteAdapter(MoEAdapter):
-    n_shared_experts = 2  # DeepSeek-V2-Lite: 2 shared experts, always active
+class DeepSeekMoEAdapter(MoEAdapter):
+    n_shared_experts = 2  # deepseek-moe-16b-base: 2 shared experts, always active (per config.json)
 
     def load(self, hf_id: str, revision: str | None, quantization: str):
         bnb_config = None
@@ -55,10 +59,10 @@ class DeepSeekV2LiteAdapter(MoEAdapter):
         self._captures: dict[int, RoutingCapture] = {}
         self.resolved_revision = getattr(self.model.config, "_commit_hash", revision)
 
-        sample_mlp = self.model.model.layers[1].mlp  # layer 0 is dense in DeepSeek-V2-Lite; MoE starts layer 1
+        sample_mlp = self.model.model.layers[1].mlp  # layer 0 is dense; MoE starts layer 1
         if not hasattr(sample_mlp, "gate"):
             raise AttributeError(
-                "DeepSeekV2LiteAdapter assumes model.model.layers[i>=1].mlp.gate exists; "
+                "DeepSeekMoEAdapter assumes model.model.layers[i>=1].mlp.gate exists; "
                 "it doesn't on this checkpoint/trust_remote_code revision. "
                 "Inspect the cached modeling_deepseek.py and update this adapter before proceeding."
             )
@@ -67,13 +71,13 @@ class DeepSeekV2LiteAdapter(MoEAdapter):
         handles = []
         for i, layer in enumerate(self.model.model.layers):
             if not hasattr(layer.mlp, "gate"):
-                continue  # dense (non-MoE) layer, e.g. layer 0 in V2-Lite — nothing to hook
+                continue  # dense (non-MoE) layer, e.g. layer 0 — nothing to hook
             handles.append(layer.mlp.gate.register_forward_hook(self._make_hook(i)))
         return handles
 
     def _make_hook(self, layer_idx: int):
         def hook(module, inputs, output):
-            # DeepSeek-V2 gate forward returns (topk_idx, topk_weight, aux_loss);
+            # DeepSeekMoE gate forward returns (topk_idx, topk_weight, aux_loss);
             # it does NOT expose full pre-topk softmax probs directly, so we
             # recompute them from the router's raw logits via the module's own
             # weight matrix applied to the hook's input — this mirrors the

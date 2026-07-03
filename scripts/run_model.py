@@ -4,7 +4,7 @@
 Usage:
     python scripts/run_model.py --model olmoe
     python scripts/run_model.py --model qwen_moe
-    python scripts/run_model.py --model deepseek_v2lite
+    python scripts/run_model.py --model deepseek_moe
 
 Re-running with the same --model after a crash resumes from the last
 completed checkpoint (see src/pipeline.py's stage-by-stage artifact writes).
@@ -32,7 +32,7 @@ from src.pipeline import run_model_pipeline
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, choices=["olmoe", "qwen_moe", "deepseek_v2lite"])
+    parser.add_argument("--model", required=True, choices=["olmoe", "qwen_moe", "deepseek_moe"])
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--results-dir", default=None, help="override output.results_dir from config")
     args = parser.parse_args()

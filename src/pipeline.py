@@ -29,9 +29,9 @@ def _adapter_for(name: str):
     if name == "qwen_moe":
         from .adapters.qwen_moe import QwenMoEAdapter
         return QwenMoEAdapter()
-    if name == "deepseek_v2lite":
-        from .adapters.deepseek_v2lite import DeepSeekV2LiteAdapter
-        return DeepSeekV2LiteAdapter()
+    if name == "deepseek_moe":
+        from .adapters.deepseek_moe import DeepSeekMoEAdapter
+        return DeepSeekMoEAdapter()
     raise ValueError(f"Unknown adapter '{name}' — add it to src/adapters/ and register it here.")
 
 
