@@ -11,7 +11,15 @@ transformers==4.45.2
 # call fails immediately with ValueError before even reaching the network.
 hf_transfer==0.1.8
 accelerate==0.34.2
-bitsandbytes==0.44.1
+# bitsandbytes is intentionally NOT pinned, same reasoning as torch above.
+# bitsandbytes==0.44.1 was found on a RunPod pod (2026-07-03, CUDA 12.8,
+# driver 570) to be missing its libbitsandbytes_cuda128.so binary and to
+# import a triton.ops module that doesn't exist in that pod's triton
+# version — "ModuleNotFoundError: No module named 'triton.ops'", raised
+# from deep inside bitsandbytes' own triton-kernel integration, not from
+# this codebase. Unpinned, pip/the environment resolves a build actually
+# compatible with the pod's installed CUDA toolkit and triton version.
+bitsandbytes
 datasets==3.0.1
 sentencepiece==0.2.0
 scipy==1.14.1

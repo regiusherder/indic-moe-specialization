@@ -87,14 +87,20 @@ the hook logic validated in the pilot notebook and is lower risk.
 
 ## Running
 
-`requirements.txt` deliberately does NOT pin `torch` — a rented pod's
-preinstalled torch build is already matched to its CUDA driver/toolkit (e.g.
-RunPod's PyTorch template ships torch 2.8.0 built for CUDA 12.8 on a driver
-570 pod). Pinning an older torch would downgrade it away from that matched
-build. `pip install -r requirements.txt` will emit a dependency-conflict
-warning about `torchvision`/`torchaudio` wanting a different torch version
-than requested — that's expected and harmless (this pipeline uses neither
-package); it's informational, not an error, and does not block the install.
+`requirements.txt` deliberately does NOT pin `torch` or `bitsandbytes` — a
+rented pod's preinstalled torch build is already matched to its CUDA
+driver/toolkit (e.g. RunPod's PyTorch template ships torch 2.8.0 built for
+CUDA 12.8 on a driver 570 pod), and bitsandbytes' prebuilt binaries are
+CUDA-version-specific. Pinning either to an older version risks a mismatch:
+`bitsandbytes==0.44.1` was found on a RunPod pod (2026-07-03) to raise
+`ModuleNotFoundError: No module named 'triton.ops'` deep inside its own
+CUDA-kernel integration — its build predates that pod's CUDA 12.8/triton
+combination. Unpinned, pip resolves a build that actually matches the
+pod's installed toolkit. `pip install -r requirements.txt` will also emit a
+dependency-conflict warning about `torchvision`/`torchaudio` wanting a
+different torch version than requested — that's expected and harmless
+(this pipeline uses neither package); it's informational, not an error,
+and does not block the install.
 
 Both `run_all.sh` and `scripts/run_model.py` set `HF_HUB_DISABLE_XET=1`
 automatically — HF Hub's fast "xet" download backend failed reproducibly
