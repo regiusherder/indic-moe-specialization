@@ -36,6 +36,13 @@ cd "$(dirname "$0")"
 # transformers/huggingface_hub import happens anywhere in this run.
 export HF_HUB_DISABLE_XET=1
 
+# NOT pinning HF_HOME here deliberately: whatever it already resolves to
+# (e.g. /workspace/.cache/huggingface on this RunPod image) is left alone,
+# so files prefetch_model.py already downloaded there are reused, not
+# re-fetched under a different path. See scripts/run_model.py and the
+# adapters for how the pipeline is told to trust that cache and skip the
+# network entirely once prefetch confirms the files are present.
+
 echo "=== [1/4] Environment checks ==="
 python3 --version
 
@@ -87,6 +94,19 @@ pip install -q -r requirements.txt
 echo ""
 echo "=== [3/4] Pre-fetching all model weights (hardened against download hangs) ==="
 python3 scripts/prefetch_model.py --all
+
+# Once prefetch confirms every file is cached locally, force ALL subsequent
+# huggingface_hub/transformers calls to skip the network entirely — including
+# the lightweight etag/HEAD "check for updates" request from_pretrained()
+# normally makes even when a local file already exists. That HEAD check is
+# the most likely explanation for the pipeline re-downloading full shards
+# after prefetch had already cached them via curl (2026-07-03): if THAT
+# small request hung/failed the same way the big downloads did, transformers
+# can fall through to re-fetching the whole file. HF_HUB_OFFLINE=1 is
+# huggingface_hub's own documented "never touch the network" switch, so this
+# is the correct fix rather than guessing at cache-path mismatches.
+export HF_HUB_OFFLINE=1
+echo "HF_HUB_OFFLINE=1 set — pipeline will only read from the cache prefetch just populated."
 
 echo ""
 echo "=== [4/4] Running full pipeline (olmoe -> qwen_moe -> deepseek_moe) ==="

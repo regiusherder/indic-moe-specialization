@@ -147,6 +147,20 @@ one from its last checkpoint. `scripts/prefetch_model.py --model <name>`
 can also be run standalone to pre-cache one model without starting the
 pipeline (useful for verifying an adapter live before committing to a full run).
 
+**If you already ran prefetch and are now calling `run_model.py` directly**
+(rather than through `run_all.sh`, which sets this automatically), export
+`HF_HUB_OFFLINE=1` first:
+```bash
+python scripts/prefetch_model.py --model olmoe
+export HF_HUB_OFFLINE=1   # skip this and from_pretrained() may re-check/re-fetch over the network
+python scripts/run_model.py --model olmoe
+```
+Without this, `from_pretrained()` still makes a small network call even when
+a local file already exists (an etag/HEAD "check for updates" request) — on
+a pod where huggingface_hub's network calls are unreliable, that lightweight
+check can itself hang or trigger a full re-download, which is exactly what
+was observed on 2026-07-03 immediately after a successful curl-based prefetch.
+
 ## Traceability — what's in `results/`
 
 ```
