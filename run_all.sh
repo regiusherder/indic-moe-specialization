@@ -30,7 +30,20 @@ nvidia-smi || { echo "No GPU visible — aborting, this pipeline requires a GPU.
 echo "=== Installing dependencies ==="
 pip install -q -r requirements.txt
 
-echo "=== Running full pipeline (olmoe -> qwen_moe -> deepseek_v2lite) ==="
+# Pre-download all three models' weights BEFORE the pipeline starts. On a
+# RunPod RTX 4090 (2026-07-03), huggingface_hub's downloader (both xet and
+# its standard HTTP path) either failed reproducibly mid-shard or stalled
+# indefinitely on multi-GB safetensors files, while plain curl to the same
+# URLs succeeded (slowly). scripts/prefetch_model.py uses snapshot_download
+# with max_workers=1 and a longer etag_timeout to mimic curl's simpler,
+# single-connection behavior, with automatic resume-on-retry. Doing this as
+# a separate up-front step (rather than relying on from_pretrained()'s
+# on-demand download inside the pipeline) means an unattended run doesn't
+# silently hang for hours on a stalled shard with nobody watching.
+echo "=== Pre-fetching all model weights (see scripts/prefetch_model.py for why) ==="
+python3 scripts/prefetch_model.py --all
+
+echo "=== Running full pipeline (olmoe -> qwen_moe -> deepseek_moe) ==="
 python3 scripts/run_all_models.py
 
 echo "=== Done. Results in ./results/ — sync this directory off the pod before terminating it. ==="
