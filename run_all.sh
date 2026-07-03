@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
-# Entrypoint for a rented GPU pod (RunPod/Lambda). Run this over SSH inside
-# a `tmux`/`screen` session so the job survives an SSH disconnect, e.g.:
+# Single entrypoint for the whole study on a rented GPU pod (RunPod/Lambda).
+# Run this ONCE inside a tmux/screen session and walk away:
 #
 #   tmux new -s indic-moe
 #   bash run_all.sh
 #   # Ctrl+B, D to detach; `tmux attach -t indic-moe` to check back in later
+#
+# What this script does, in order, so nothing needs a second manual step:
+#   1. Sanity-checks: GPU present, not accidentally running on a quota-limited
+#      network volume, enough free disk for all three models + FLORES + results
+#   2. Installs dependencies
+#   3. Pre-fetches all three models' weights via scripts/prefetch_model.py,
+#      which is hardened against the download hangs/failures hit on
+#      2026-07-03 (hard per-attempt timeout + kill + retry, single-connection
+#      transfer mode) — this is what makes the run "unattended-safe": a
+#      stalled download gets killed and retried automatically instead of
+#      silently hanging forever with nobody watching.
+#   4. Runs the actual pipeline (olmoe -> qwen_moe -> deepseek_moe)
 #
 # Does NOT use Docker by default (faster to iterate on a rented pod that
 # already has CUDA/drivers set up) — use the Dockerfile instead if you want
@@ -14,36 +26,60 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# HF Hub's "xet" fast-download backend was observed to fail reproducibly
-# mid-shard on a DeepSeek-V2-Lite download (RunPod RTX 4090, 2026-07-03):
-# "RuntimeError: Internal Writer Error: Failed to send data: receiver
-# dropped" at the same shard/offset on two separate attempts. Disabling it
-# falls back to the standard HTTP downloader, which succeeded immediately.
-# This MUST be set before any transformers/huggingface_hub import happens —
-# an unattended run has nobody to notice a silent hang or retry a crash.
+# HF Hub's "xet" fast-download backend failed reproducibly on this study's
+# models (RunPod RTX 4090, 2026-07-03). Disabled globally, before any
+# transformers/huggingface_hub import happens anywhere in this run.
 export HF_HUB_DISABLE_XET=1
 
-echo "=== Environment check ==="
+echo "=== [1/4] Environment checks ==="
 python3 --version
-nvidia-smi || { echo "No GPU visible — aborting, this pipeline requires a GPU."; exit 1; }
 
-echo "=== Installing dependencies ==="
+if ! nvidia-smi > /dev/null 2>&1; then
+    echo "FATAL: no GPU visible. This pipeline requires a GPU (tested against a single 24GB RTX 4090)." >&2
+    exit 1
+fi
+nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
+
+# Warn (don't block — some pods legitimately run everything from a network
+# mount) if the current directory looks like RunPod's shared network volume
+# rather than the pod's own container disk. Downloading ~75GB of model
+# weights onto a quota-limited network mount was the root cause of a
+# "Disk quota exceeded" error on 2026-07-03 even with the container disk
+# almost empty.
+CWD_FS=$(df "$PWD" | tail -1)
+if echo "$CWD_FS" | grep -qE "mfs#|nfs|:/workspace|runpod-volume"; then
+    echo ""
+    echo "!!! WARNING: current directory appears to be on a network-mounted filesystem:"
+    echo "    $CWD_FS"
+    echo "!!! Network volumes on RunPod are often quota-limited per user even when the"
+    echo "!!! pool shows huge free space. If this run later fails with 'Disk quota"
+    echo "!!! exceeded', re-clone and run this repo from the pod's local container disk"
+    echo "!!! instead (commonly /root or /)."
+    echo ""
+    sleep 5
+fi
+
+AVAIL_GB=$(df --output=avail -BG "$PWD" | tail -1 | tr -dc '0-9')
+if [ "${AVAIL_GB:-0}" -lt 100 ]; then
+    echo "FATAL: only ${AVAIL_GB}GB free at $PWD. This study needs ~100GB+ (three" >&2
+    echo "models cached simultaneously at ~14+28+33GB, plus FLORES, results, and" >&2
+    echo "working headroom). Resize the volume before running." >&2
+    exit 1
+fi
+echo "Disk check OK: ${AVAIL_GB}GB free at $PWD"
+
+echo ""
+echo "=== [2/4] Installing dependencies ==="
 pip install -q -r requirements.txt
 
-# Pre-download all three models' weights BEFORE the pipeline starts. On a
-# RunPod RTX 4090 (2026-07-03), huggingface_hub's downloader (both xet and
-# its standard HTTP path) either failed reproducibly mid-shard or stalled
-# indefinitely on multi-GB safetensors files, while plain curl to the same
-# URLs succeeded (slowly). scripts/prefetch_model.py uses snapshot_download
-# with max_workers=1 and a longer etag_timeout to mimic curl's simpler,
-# single-connection behavior, with automatic resume-on-retry. Doing this as
-# a separate up-front step (rather than relying on from_pretrained()'s
-# on-demand download inside the pipeline) means an unattended run doesn't
-# silently hang for hours on a stalled shard with nobody watching.
-echo "=== Pre-fetching all model weights (see scripts/prefetch_model.py for why) ==="
+echo ""
+echo "=== [3/4] Pre-fetching all model weights (hardened against download hangs) ==="
 python3 scripts/prefetch_model.py --all
 
-echo "=== Running full pipeline (olmoe -> qwen_moe -> deepseek_moe) ==="
+echo ""
+echo "=== [4/4] Running full pipeline (olmoe -> qwen_moe -> deepseek_moe) ==="
 python3 scripts/run_all_models.py
 
+echo ""
 echo "=== Done. Results in ./results/ — sync this directory off the pod before terminating it. ==="
+echo "    Example: scp -r <pod-user>@<pod-host>:$(pwd)/results ./results-from-runpod"
