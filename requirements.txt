@@ -1,4 +1,10 @@
-torch==2.4.1
+# torch is intentionally NOT pinned here. RunPod's PyTorch template ships a
+# torch build matched to its preinstalled CUDA driver/toolkit (e.g. 2.8.0+cu128
+# on a driver 570 pod) — pinning an older torch version downgrades it away
+# from that matched build and risks a CUDA/driver mismatch at model-load time,
+# which is a worse failure mode than "unpinned" for a GPU-dependent pipeline.
+# If you need a specific torch version, pin it to match whatever your pod's
+# nvidia-smi reports as the CUDA version, not a version chosen in the abstract.
 transformers==4.45.2
 accelerate==0.34.2
 bitsandbytes==0.44.1

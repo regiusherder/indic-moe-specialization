@@ -62,6 +62,15 @@ notebook and is lower risk.
 
 ## Running
 
+`requirements.txt` deliberately does NOT pin `torch` — a rented pod's
+preinstalled torch build is already matched to its CUDA driver/toolkit (e.g.
+RunPod's PyTorch template ships torch 2.8.0 built for CUDA 12.8 on a driver
+570 pod). Pinning an older torch would downgrade it away from that matched
+build. `pip install -r requirements.txt` will emit a dependency-conflict
+warning about `torchvision`/`torchaudio` wanting a different torch version
+than requested — that's expected and harmless (this pipeline uses neither
+package); it's informational, not an error, and does not block the install.
+
 **Locally (fast iteration, needs a GPU):**
 ```bash
 pip install -r requirements.txt
