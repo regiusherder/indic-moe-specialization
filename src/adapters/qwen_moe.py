@@ -1,19 +1,18 @@
 """Qwen1.5-MoE-A2.7B adapter. DeepSeekMoE-style: 60 fine-grained routed experts
-(top-4) + 4 shared experts that fire on every token unconditionally.
+(top-4) + 1 shared expert (a single wider MLP, gated by `shared_expert_gate`)
+that fires on every token unconditionally.
 
-IMPORTANT — unverified against a live checkpoint: the HF `Qwen2MoeSparseMoeBlock`
-implementation (as of transformers 4.45.x) exposes `.gate` (router Linear,
-returns raw logits only — NOT a tuple like OLMoE) and a separate
-`.shared_expert` + `.shared_expert_gate`. This adapter hooks `.gate` for
-routing capture and the whole `Qwen2MoeSparseMoeBlock.forward` for ablation
-(reimplementing top-k dispatch on the routed experts only, skipping the shared
-expert entirely, since shared-expert output is never zeroed by design).
-
-Before a real unattended run: load the model once, print
-`model.model.layers[0].mlp` and diff it against the assumptions coded here.
-If the module names differ from what's hardcoded below, this adapter will
-raise AttributeError immediately (fails loud) rather than silently hooking
-nothing — do not catch that error, fix the attribute path.
+VERIFIED against the live checkpoint on 2026-07-03 (RunPod, transformers
+4.45.2): `model.model.layers[0].mlp` is `Qwen2MoeSparseMoeBlock` with
+`.gate` (Linear(2048→60), returns raw logits directly — NOT a tuple like
+OLMoE's newer format), `.experts` (ModuleList of 60 `Qwen2MoeMLP`), a single
+`.shared_expert` (one wider `Qwen2MoeMLP`, not 4 as an earlier design note
+assumed — the "DeepSeekMoE-style" architecture family can have any number of
+shared experts; Qwen1.5-MoE-A2.7B specifically has exactly 1), and
+`.shared_expert_gate` (Linear(2048→1)). This adapter hooks `.gate` for
+routing capture and rewrites its logits for ablation (reimplementing top-k
+dispatch on the routed experts only, skipping the shared expert entirely,
+since shared-expert output is never zeroed by design).
 """
 import torch
 import torch.nn.functional as F
@@ -23,7 +22,7 @@ from .base import MoEAdapter, RoutingCapture
 
 
 class QwenMoEAdapter(MoEAdapter):
-    n_shared_experts = 4  # Qwen1.5-MoE-A2.7B: 4 shared experts, always active
+    n_shared_experts = 1  # Qwen1.5-MoE-A2.7B: 1 shared expert, always active (verified live)
 
     def load(self, hf_id: str, revision: str | None, quantization: str):
         bnb_config = None

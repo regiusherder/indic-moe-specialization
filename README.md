@@ -32,33 +32,41 @@ into a rigorous, unattended, three-model study by fixing four gaps:
    ablation trials per language-family group, so the result can show ablating
    *specific* experts hurts more than ablating *any* experts of the same count.
 4. **Three-model, architecture-aware** — OLMoE (no shared experts), Qwen1.5-MoE
-   (60 routed + 4 shared), DeepSeek-V2-Lite (64 routed + 2 shared) each get a
-   dedicated adapter (`src/adapters/`) so shared experts are correctly excluded
+   (60 routed + 1 shared, verified live), DeepSeek-V2-Lite (64 routed + 2 shared,
+   not yet verified live) each get a dedicated adapter (`src/adapters/`) so
+   shared experts are correctly excluded
    from specialization analysis, while the JSD/permutation/ablation logic
    itself stays architecture-agnostic.
 
 ## Before running for real
 
-`src/adapters/qwen_moe.py` and `src/adapters/deepseek_v2lite.py` are written
-against the *documented* architecture of these models (see the Conversation
-Log) but have **not been executed against the live checkpoints**. Both files
-say so explicitly at the top with what to check. Before the unattended run:
+`src/adapters/qwen_moe.py` was **verified live** on 2026-07-03 (RunPod RTX
+4090, transformers 4.45.2) — `model.model.layers[0].mlp` matched every
+assumption the adapter makes (`.gate` returns raw logits directly, `.experts`
+is a 60-module ModuleList, `.shared_expert` + `.shared_expert_gate` present),
+with one correction: Qwen1.5-MoE-A2.7B has exactly **1** shared expert, not 4
+as an earlier design note assumed (now fixed in the adapter's `n_shared_experts`
+and its docstring). This doesn't change any ablation/JSD logic — the code
+never touched `shared_expert` either way — but it was wrong metadata that
+would have ended up in a paper.
+
+`src/adapters/deepseek_v2lite.py` is still written against the *documented*
+architecture only (see the Conversation Log) and has **not been executed
+against the live checkpoint**. Before running it for real:
 
 ```bash
 python -c "
 from transformers import AutoModelForCausalLM
-m = AutoModelForCausalLM.from_pretrained('Qwen/Qwen1.5-MoE-A2.7B', device_map='auto')
-print(m.model.layers[0].mlp)
+m = AutoModelForCausalLM.from_pretrained('deepseek-ai/DeepSeek-V2-Lite', trust_remote_code=True, device_map='auto')
+print(m.model.layers[1].mlp)  # layer 0 is dense in V2-Lite
 "
 ```
 
-...and confirm the printed module matches what `qwen_moe.py` assumes
-(`.gate`, `.experts`, `.shared_expert`, `.shared_expert_gate`). Same for
-DeepSeek-V2-Lite (`trust_remote_code=True` required). If it doesn't match,
-fix the adapter before trusting any output — these two adapters are the
-highest-risk part of this codebase precisely because they're least verified.
-OLMoE's adapter (`olmoe.py`) mirrors the hook logic validated in the pilot
-notebook and is lower risk.
+...and confirm the printed module has `.gate` returning `(topk_idx,
+topk_weight, aux_loss)` as the adapter assumes. If it doesn't match, fix the
+adapter before trusting any output — this is now the only unverified,
+highest-risk adapter in the codebase. OLMoE's adapter (`olmoe.py`) mirrors
+the hook logic validated in the pilot notebook and is lower risk.
 
 ## Running
 
