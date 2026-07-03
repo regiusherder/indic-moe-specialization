@@ -16,14 +16,29 @@ build the local HF cache directory by hand with curl.
 How it works: this script (1) lists a repo's files via the small, fast HF
 API `GET /api/models/{repo_id}` call (JSON, not the large-file path), then
 (2) curls each file directly into
-`~/.cache/huggingface/hub/models--{org}--{name}/snapshots/main/{filename}`.
-huggingface_hub's cache resolution only checks that this path exists — it
-does not require the blobs/ + symlink structure it creates itself, and
-falls back to treating the revision string literally as the snapshot
-folder name when no `refs/{revision}` file is present. Once cached this
-way, `from_pretrained(repo_id)` finds everything locally with zero
-network calls (verified against huggingface_hub's cache resolution logic,
-2026-07-03).
+`{HF_HUB_CACHE}/models--{org}--{name}/snapshots/{snapshot_name}/{filename}`.
+
+IMPORTANT correction (2026-07-03, second incident): an earlier version of
+this script always used the literal string "main" as the snapshot folder
+name, assuming huggingface_hub falls back to treating the revision string
+literally when no `refs/{revision}` pointer file exists. That assumption
+broke in practice: a PARTIAL huggingface_hub download attempt had already
+created `refs/main` pointing at a real commit hash (e.g.
+`9b0c1aa8...`), with a snapshot dir under that hash containing only the
+small config/tokenizer files (the safetensors shards never finished). Once
+that `refs/main` file exists, huggingface_hub's offline resolver ALWAYS
+follows it to that hash-named directory — it never falls back to checking
+a literal `snapshots/main/` folder, no matter what's in it. So this
+script's `snapshots/main/` (fully populated by curl) was silently ignored,
+and `HF_HUB_OFFLINE=1` correctly reported "file not found" because it was
+looking in the OTHER (incomplete) snapshot directory the whole time.
+
+Fix: before writing anything, this script now checks whether
+`refs/{revision}` already exists. If it does, files are written into
+THAT hash-named snapshot directory (so any pre-existing partial download's
+pointer is honored and completed, not orphaned). If it doesn't, this script
+creates `refs/{revision}` itself, pointing at a snapshot directory named
+after the revision string — so a completely fresh cache is unambiguous too.
 
 Usage:
     python scripts/prefetch_model.py --model olmoe
@@ -104,9 +119,57 @@ def curl_file(url: str, dest: Path) -> bool:
 SKIP_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".md", ".gitattributes")
 
 
+def resolve_snapshot_dir(hf_id: str, revision: str | None) -> Path:
+    """Determine which snapshot directory huggingface_hub will actually look
+    in, honoring a pre-existing refs/{revision} pointer from any earlier
+    (possibly partial) huggingface_hub download attempt. Creates refs/{revision}
+    if it doesn't exist yet, so resolution is unambiguous either way."""
+    ref_name = revision or "main"
+    repo_cache = cache_dir_for(hf_id)
+    ref_path = repo_cache / "refs" / ref_name
+
+    if ref_path.exists():
+        commit_hash = ref_path.read_text().strip()
+        print(f"[{hf_id}] found existing refs/{ref_name} -> {commit_hash} "
+              f"(from a prior huggingface_hub attempt) — writing files there, not a fresh 'main' folder")
+        return repo_cache / "snapshots" / commit_hash
+
+    snapshot_dir = repo_cache / "snapshots" / ref_name
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    ref_path.write_text(ref_name)
+    print(f"[{hf_id}] no existing refs/{ref_name} found — created one pointing at "
+          f"snapshots/{ref_name} (this script's own resolution, not a real commit hash)")
+    return snapshot_dir
+
+
+def clean_stale_cache_state(hf_id: str, files: list[str]):
+    """Remove a `.no_exist` marker directory if huggingface_hub previously
+    recorded (incorrectly, from this script's point of view) that some of
+    this repo's files don't exist upstream — that marker makes
+    huggingface_hub refuse to look for them again even after this script
+    downloads them. Also drops any `.incomplete` blob fragments from an
+    earlier partial huggingface_hub attempt so they don't get mistaken for
+    real content."""
+    repo_cache = cache_dir_for(hf_id)
+    no_exist_dir = repo_cache / ".no_exist"
+    if no_exist_dir.exists():
+        import shutil
+        print(f"[{hf_id}] removing stale .no_exist marker directory ({no_exist_dir}) — "
+              f"leftover from an earlier failed huggingface_hub attempt, would otherwise "
+              f"make huggingface_hub refuse to recognize files this script downloads")
+        shutil.rmtree(no_exist_dir)
+
+    blobs_dir = repo_cache / "blobs"
+    if blobs_dir.exists():
+        for incomplete in blobs_dir.glob("*.incomplete"):
+            print(f"[{hf_id}] removing stale incomplete blob fragment: {incomplete.name}")
+            incomplete.unlink()
+
+
 def prefetch(hf_id: str, revision: str | None):
     files = list_repo_files(hf_id, revision)
-    snapshot_dir = cache_dir_for(hf_id) / "snapshots" / (revision or "main")
+    clean_stale_cache_state(hf_id, files)
+    snapshot_dir = resolve_snapshot_dir(hf_id, revision)
 
     for filename in files:
         if any(filename.lower().endswith(suf) for suf in SKIP_SUFFIXES):
@@ -146,10 +209,10 @@ def main():
         model_cfg = config["models"][model_key]
         prefetch(model_cfg["hf_id"], model_cfg.get("revision"))
 
-    print("\nAll requested models cached via curl. from_pretrained() will read these")
-    print("files from local disk with no network call, since huggingface_hub's cache")
-    print("resolution only checks that snapshots/{revision}/{filename} exists — it does")
-    print("not require the blobs/+symlink structure it would normally create itself.")
+    print("\nAll requested models cached via curl, into the exact snapshot directory")
+    print("huggingface_hub's refs/{revision} pointer resolves to (creating that pointer")
+    print("if none existed yet). from_pretrained() with HF_HUB_OFFLINE=1 will read these")
+    print("files from local disk with no network call.")
 
 
 if __name__ == "__main__":
