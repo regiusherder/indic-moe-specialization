@@ -108,18 +108,38 @@ pip install -r requirements.txt
 python scripts/run_model.py --model olmoe
 ```
 
-**Unattended on a rented GPU pod (RunPod/Lambda, single 24GB GPU — e.g. RTX 4090):**
+**Unattended on a rented GPU pod (RunPod/Lambda, single 24GB GPU — e.g. RTX 4090) —
+this is a single command, no manual steps in between:**
 ```bash
-git clone <this-repo> && cd indic-moe-specialization
+# clone onto the pod's OWN container disk, not a mounted network volume
+# (RunPod sometimes defaults to a quota-limited shared mount like /workspace
+# — check with `df -h .` after cloning; run_all.sh also checks this itself)
+cd /root
+git clone https://github.com/regiusherder/indic-moe-specialization.git
+cd indic-moe-specialization
+
 tmux new -s indic-moe        # survive SSH disconnect
 bash run_all.sh
 # Ctrl+B, D to detach; tmux attach -t indic-moe to check back later
 ```
 
-Runs all three models sequentially (one at a time fits a single 24GB GPU in
-4-bit). If one model's pipeline crashes, the batch runner logs the failure
-and continues to the next model — re-run `python scripts/run_model.py --model
-<name>` afterward to resume just the failed one from its last checkpoint.
+`run_all.sh` does everything in order and needs nothing else from you:
+1. Sanity-checks GPU, disk location, and free space (aborts early with a
+   clear message if any of these look wrong, rather than failing hours in)
+2. Installs dependencies
+3. Pre-fetches all three models' weights via `scripts/prefetch_model.py` —
+   hardened against a download-hang failure mode hit on 2026-07-03 (a stuck
+   transfer that survived Ctrl+C): each attempt runs in a subprocess under a
+   hard 45-minute timeout, gets killed and retried (up to 6 attempts) if it
+   stalls, rather than hanging forever unattended
+4. Runs the actual pipeline (olmoe → qwen_moe → deepseek_moe)
+
+If one model's pipeline crashes after prefetch succeeds, the batch runner
+logs the failure and continues to the next model — re-run `python
+scripts/run_model.py --model <name>` afterward to resume just the failed
+one from its last checkpoint. `scripts/prefetch_model.py --model <name>`
+can also be run standalone to pre-cache one model without starting the
+pipeline (useful for verifying an adapter live before committing to a full run).
 
 ## Traceability — what's in `results/`
 
