@@ -1,0 +1,68 @@
+# Single source of truth for the study. Every script reads this file;
+# nothing is hardcoded elsewhere. Changing an experiment parameter means
+# changing exactly one line here, and the run manifest hashes this file
+# so every result is traceable to the config that produced it.
+
+seed: 42
+
+models:
+  olmoe:
+    hf_id: "allenai/OLMoE-1B-7B-0125"
+    revision: null            # pin to a commit hash once you've picked a version, e.g. "main" resolves at run time otherwise
+    adapter: "olmoe"
+    quantization: "4bit"
+  qwen_moe:
+    hf_id: "Qwen/Qwen1.5-MoE-A2.7B"
+    revision: null
+    adapter: "qwen_moe"
+    quantization: "4bit"
+  deepseek_v2lite:
+    hf_id: "deepseek-ai/DeepSeek-V2-Lite"
+    revision: null
+    adapter: "deepseek_v2lite"
+    quantization: "4bit"
+
+# FLORES-200 language codes with linguistic metadata used for grouping/plots.
+# Urdu is the critical script-vs-family control (near-identical to Hindi, different script).
+languages:
+  english:   {code: eng_Latn, family: Indo-European, script: Latin}
+  hindi:     {code: hin_Deva, family: Indo-Aryan,     script: Devanagari}
+  marathi:   {code: mar_Deva, family: Indo-Aryan,     script: Devanagari}
+  bengali:   {code: ben_Beng, family: Indo-Aryan,     script: Bengali}
+  gujarati:  {code: guj_Gujr, family: Indo-Aryan,     script: Gujarati}
+  punjabi:   {code: pan_Guru, family: Indo-Aryan,     script: Gurmukhi}
+  urdu:      {code: urd_Arab, family: Indo-Aryan,     script: Perso-Arabic}
+  tamil:     {code: tam_Taml, family: Dravidian,      script: Tamil}
+  telugu:    {code: tel_Telu, family: Dravidian,      script: Telugu}
+  malayalam: {code: mal_Mlym, family: Dravidian,      script: Malayalam}
+  kannada:   {code: kan_Knda, family: Dravidian,      script: Kannada}
+
+data:
+  flores_url: "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz"
+  flores_sha256: null   # filled in automatically on first download and verified on every subsequent run
+  split: "devtest"
+  # Sampling is capped by TOKEN count, not sentence count or character count.
+  # This closes the fertility confound: every language contributes the same
+  # number of routing decisions, regardless of how many tokens its script needs
+  # to represent the same content.
+  max_tokens_per_language: 20000
+  max_sentences_pool: 1012   # full FLORES-200 devtest size; sampling stops early once max_tokens_per_language is hit
+
+routing:
+  # JSD is computed per-layer (not just one "representative" layer) using the
+  # full softmax routing distribution over routed experts (shared experts,
+  # where present, are excluded — see adapters/).
+  permutation_test:
+    n_permutations: 1000
+    alpha: 0.001
+  bootstrap:
+    n_resamples: 200      # sentence-level bootstrap for CIs on JSD estimates
+
+ablation:
+  top_n_experts: 8
+  n_random_controls: 10   # number of random-expert-ablation runs per language-group, for the causal control
+  perplexity_max_tokens: 2000
+
+output:
+  results_dir: "results"
+  checkpoint_after_each: true   # write intermediate artifacts after every language/model so a crash loses at most one unit of work

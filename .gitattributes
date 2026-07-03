@@ -1,0 +1,4 @@
+# run_all.sh executes on a Linux GPU pod — force LF regardless of the
+# cloning machine's core.autocrlf, or a Windows checkout breaks its shebang.
+*.sh text eol=lf
+Dockerfile text eol=lf
