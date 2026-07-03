@@ -79,7 +79,24 @@ def run_ablation_study(
     per group + n_random_controls forward passes, not n_random_controls per group.
     """
     results = []
-    layers_with_moe = list(next(iter(targeted_experts_by_group.values())).keys())
+    if not targeted_experts_by_group:
+        raise ValueError("targeted_experts_by_group is empty — no language-family groups to ablate. "
+                          "Check that config['languages'] families match what top_experts_for_group produced.")
+
+    # All groups must agree on which layers have MoE (they should — group
+    # membership doesn't affect which layers are dense vs. routed, that's an
+    # architecture property). Verify rather than silently trusting the first
+    # group's keys, since a mismatch would mean random controls ablate the
+    # wrong layer set for some groups without any error.
+    per_group_layers = {name: set(experts.keys()) for name, experts in targeted_experts_by_group.items()}
+    layer_sets = list(per_group_layers.values())
+    if any(s != layer_sets[0] for s in layer_sets[1:]):
+        raise RuntimeError(
+            f"Language-family groups disagree on which layers have MoE experts: {per_group_layers}. "
+            f"This should be an architecture-only property (same for every group) — investigate "
+            f"top_experts_for_group's per-language distributions before trusting any ablation result."
+        )
+    layers_with_moe = sorted(layer_sets[0])
 
     random_control_sets = [
         random_experts_for_group(

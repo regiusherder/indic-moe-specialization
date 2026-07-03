@@ -45,6 +45,11 @@ def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_
 
     print(f"\n{'='*70}\n{model_key}: starting from checkpoint stage '{checkpoint['stage']}'\n{'='*70}")
 
+    if checkpoint.get("stage") == "complete" and (out_dir / "04_ablation" / "ablation_results.csv").exists():
+        print(f"{model_key}: already complete (checkpoint says so and ablation_results.csv exists) — "
+              f"skipping entirely, no model load needed. Delete {checkpoint_path} to force a re-run.")
+        return out_dir
+
     # ---- Stage 0: data ----
     cache_dir = results_root / "_flores_cache"
     flores_dir, flores_sha256 = download_flores(cache_dir, config["data"]["flores_url"], config["data"]["flores_sha256"])
@@ -257,6 +262,9 @@ def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_
         for family in families:
             group_langs = [l for l, m in config["languages"].items() if m["family"] == family and l in records]
             if not group_langs:
+                print(f"  WARNING: family '{family}' has no languages with extracted routing records — "
+                      f"skipping it in the ablation study. This means fewer than expected family "
+                      f"groups will appear in ablation_results.csv; check for an earlier extraction failure.")
                 continue
             targeted_by_group[family] = top_experts_for_group(
                 per_lang_layer_dist, group_langs, adapter.num_layers,
