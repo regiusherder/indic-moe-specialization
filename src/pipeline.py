@@ -136,8 +136,7 @@ def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_
                 continue
             print(f"  [resume] {lang_name}: checkpoint is stale/invalid (missing or "
                   f"ragged soft-routing data) — deleting and re-extracting")
-            lang_ckpt.unlink()
-            lang_ckpt.unlink()
+            lang_ckpt.unlink(missing_ok=True)
 
         print(f"  Extracting routing for {lang_name} ...")
         per_sentence_selected = {}
