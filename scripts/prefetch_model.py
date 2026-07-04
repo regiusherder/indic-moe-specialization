@@ -74,18 +74,28 @@ def cache_dir_for(hf_id: str) -> Path:
     return HF_HUB_CACHE / f"models--{org_name}"
 
 
-def list_repo_files(hf_id: str, revision: str | None) -> list[str]:
-    """Small, fast metadata call — not the large-file download path that hangs."""
+def list_repo_files(hf_id: str, revision: str | None) -> tuple[list[str], str]:
+    """Small, fast metadata call — not the large-file download path that hangs.
+    Returns (files, commit_sha). The sha matters: transformers' dynamic-module
+    loader (trust_remote_code models) extracts the commit hash from the cache
+    path with a regex requiring a 40-hex snapshot folder name — a folder
+    literally named "main" makes that extraction return None and crash with
+    `unsupported operand type(s) for /: 'PosixPath' and 'NoneType'`
+    (hit live 2026-07-04 on deepseek-moe-16b-base)."""
     ref = revision or "main"
     url = f"https://huggingface.co/api/models/{hf_id}?revision={ref}"
     print(f"[{hf_id}] listing files via {url} ...")
     with urllib.request.urlopen(url, timeout=30) as resp:
         data = json.loads(resp.read())
     files = [s["rfilename"] for s in data.get("siblings", [])]
+    sha = data.get("sha")
     if not files:
         raise RuntimeError(f"[{hf_id}] API returned no file list — check the repo ID and revision.")
-    print(f"[{hf_id}] {len(files)} files found: {files}")
-    return files
+    if not sha:
+        raise RuntimeError(f"[{hf_id}] API response has no 'sha' — cannot build a cache layout "
+                           f"transformers' dynamic-module loader will accept.")
+    print(f"[{hf_id}] {len(files)} files found at commit {sha}")
+    return files, sha
 
 
 def _have_aria2() -> bool:
@@ -153,26 +163,42 @@ def download_file(url: str, dest: Path) -> bool:
 SKIP_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".md", ".gitattributes")
 
 
-def resolve_snapshot_dir(hf_id: str, revision: str | None) -> Path:
-    """Determine which snapshot directory huggingface_hub will actually look
-    in, honoring a pre-existing refs/{revision} pointer from any earlier
-    (possibly partial) huggingface_hub download attempt. Creates refs/{revision}
-    if it doesn't exist yet, so resolution is unambiguous either way."""
+def resolve_snapshot_dir(hf_id: str, revision: str | None, sha: str) -> Path:
+    """The snapshot directory MUST be named with the real 40-hex commit sha —
+    transformers' trust_remote_code machinery regex-extracts the commit hash
+    from this path and crashes on a non-hex folder name (see list_repo_files).
+
+    Also migrates two kinds of pre-existing state without re-downloading:
+      - a legacy `snapshots/main/` folder from this script's earlier versions
+        (renamed to snapshots/{sha}, files preserved)
+      - a partial huggingface_hub-created snapshots/{sha} (files merged into
+        by the download loop's per-file exists-check)
+    refs/{revision} is (re)written to point at the sha either way."""
     ref_name = revision or "main"
     repo_cache = cache_dir_for(hf_id)
+    snapshot_dir = repo_cache / "snapshots" / sha
+
+    # migrate a legacy literal-named snapshot dir (e.g. snapshots/main) so
+    # its already-downloaded multi-GB shards are reused, not re-fetched
+    legacy_dir = repo_cache / "snapshots" / ref_name
+    if legacy_dir.exists() and legacy_dir != snapshot_dir:
+        if not snapshot_dir.exists():
+            print(f"[{hf_id}] migrating legacy snapshots/{ref_name} -> snapshots/{sha} (rename, no re-download)")
+            legacy_dir.rename(snapshot_dir)
+        else:
+            print(f"[{hf_id}] both snapshots/{ref_name} and snapshots/{sha} exist — moving missing files over")
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            for item in legacy_dir.iterdir():
+                target = snapshot_dir / item.name
+                if not target.exists():
+                    item.rename(target)
+            import shutil
+            shutil.rmtree(legacy_dir)
+
     ref_path = repo_cache / "refs" / ref_name
-
-    if ref_path.exists():
-        commit_hash = ref_path.read_text().strip()
-        print(f"[{hf_id}] found existing refs/{ref_name} -> {commit_hash} "
-              f"(from a prior huggingface_hub attempt) — writing files there, not a fresh 'main' folder")
-        return repo_cache / "snapshots" / commit_hash
-
-    snapshot_dir = repo_cache / "snapshots" / ref_name
     ref_path.parent.mkdir(parents=True, exist_ok=True)
-    ref_path.write_text(ref_name)
-    print(f"[{hf_id}] no existing refs/{ref_name} found — created one pointing at "
-          f"snapshots/{ref_name} (this script's own resolution, not a real commit hash)")
+    ref_path.write_text(sha)
+    print(f"[{hf_id}] refs/{ref_name} -> {sha}; snapshot dir: {snapshot_dir}")
     return snapshot_dir
 
 
@@ -201,9 +227,9 @@ def clean_stale_cache_state(hf_id: str, files: list[str]):
 
 
 def prefetch(hf_id: str, revision: str | None):
-    files = list_repo_files(hf_id, revision)
+    files, sha = list_repo_files(hf_id, revision)
     clean_stale_cache_state(hf_id, files)
-    snapshot_dir = resolve_snapshot_dir(hf_id, revision)
+    snapshot_dir = resolve_snapshot_dir(hf_id, revision, sha)
 
     for filename in files:
         if any(filename.lower().endswith(suf) for suf in SKIP_SUFFIXES):
@@ -213,7 +239,9 @@ def prefetch(hf_id: str, revision: str | None):
         if dest.exists() and dest.stat().st_size > 0:
             print(f"[{hf_id}] {filename}: already cached ({dest.stat().st_size / 1e6:.1f} MB), skipping")
             continue
-        url = f"https://huggingface.co/{hf_id}/resolve/{revision or 'main'}/{filename}"
+        # resolve by the exact sha, not the branch name — if the repo gets a
+        # new commit mid-run, all files still come from one consistent revision
+        url = f"https://huggingface.co/{hf_id}/resolve/{sha}/{filename}"
         ok = download_file(url, dest)
         if not ok:
             raise RuntimeError(

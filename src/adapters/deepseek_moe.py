@@ -42,14 +42,15 @@ class DeepSeekMoEAdapter(MoEAdapter):
                 llm_int8_skip_modules=["gate"],
             )
 
+        # torch_dtype not `dtype` — see olmoe.py for the version-compat rationale
+        load_kwargs = {"quantization_config": bnb_config} if bnb_config is not None else {"torch_dtype": torch.float16}
         self.tokenizer = AutoTokenizer.from_pretrained(hf_id, revision=revision, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             hf_id,
             revision=revision,
-            quantization_config=bnb_config,
-            dtype=torch.float16 if bnb_config is None else None,
             device_map="auto",
             trust_remote_code=True,
+            **load_kwargs,
         )
         self.model.eval()
 

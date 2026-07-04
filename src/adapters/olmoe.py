@@ -35,13 +35,18 @@ class OLMoEAdapter(MoEAdapter):
                 llm_int8_skip_modules=["gate"],
             )
 
+        # torch_dtype (not `dtype`): 4.45.x only knows torch_dtype; newer
+        # transformers accept it too (with a deprecation warning). Passing
+        # `dtype` on 4.45.x falls through to the model constructor and
+        # raises TypeError (hit live 2026-07-04). Only pass it when NOT
+        # quantizing — bitsandbytes controls dtype itself.
+        load_kwargs = {"quantization_config": bnb_config} if bnb_config is not None else {"torch_dtype": torch.float16}
         self.tokenizer = AutoTokenizer.from_pretrained(hf_id, revision=revision)
         self.model = AutoModelForCausalLM.from_pretrained(
             hf_id,
             revision=revision,
-            quantization_config=bnb_config,
-            dtype=torch.float16 if bnb_config is None else None,
             device_map="auto",
+            **load_kwargs,
         )
         self.model.eval()
 
