@@ -130,36 +130,37 @@ bash run_all.sh
 ```
 
 `run_all.sh` does everything in order and needs nothing else from you:
-1. Sanity-checks GPU, disk location, and free space (aborts early with a
-   clear message if any of these look wrong, rather than failing hours in)
-2. Installs dependencies
-3. Pre-fetches all three models' weights via `scripts/prefetch_model.py` —
-   hardened against a download-hang failure mode hit on 2026-07-03 (a stuck
-   transfer that survived Ctrl+C): each attempt runs in a subprocess under a
-   hard 45-minute timeout, gets killed and retried (up to 6 attempts) if it
-   stalls, rather than hanging forever unattended
-4. Runs the actual pipeline (olmoe → qwen_moe → deepseek_moe)
+1. Sanity-checks GPU and free space, and **refuses to run from a network
+   volume** (fatal, not a warning — see below)
+2. **Overrides `HF_HOME` to `./.hf_cache` inside the repo.** This is the
+   root-cause fix for most of the infrastructure failures hit on
+   2026-07-03: RunPod's PyTorch template silently sets `HF_HOME` to
+   `/workspace/.cache/huggingface` — the shared, per-user-quota-limited,
+   slow network volume. That one default explains the "Disk quota
+   exceeded" errors (container disk was empty; the quota was on
+   /workspace), the downloads hanging at 0% (multi-GB writes through a
+   slow network filesystem), the painfully slow curl transfers
+   (bottlenecked on network-mount writes, not the CDN connection), and
+   stale half-finished cache state surviving across pod restarts. Keeping
+   the cache inside the repo pins it to fast local disk and gives every
+   fresh clone a clean cache.
+3. Installs dependencies, including `aria2` (best-effort via apt)
+4. Pre-fetches all three models' weights via `scripts/prefetch_model.py`
+   using **aria2c with 16 parallel connections per file** (much faster than
+   the single-connection curl it originally used; falls back to curl if
+   aria2c is unavailable or fails repeatedly). Every attempt runs under a
+   hard 45-minute timeout with kill-and-resume retry, so a stalled transfer
+   can't hang the run unattended.
+5. Sets `HF_HUB_OFFLINE=1` and runs the actual pipeline
+   (olmoe → qwen_moe → deepseek_moe) purely from the local cache — no
+   network calls at model-load time at all.
 
 If one model's pipeline crashes after prefetch succeeds, the batch runner
 logs the failure and continues to the next model — re-run `python
 scripts/run_model.py --model <name>` afterward to resume just the failed
-one from its last checkpoint. `scripts/prefetch_model.py --model <name>`
-can also be run standalone to pre-cache one model without starting the
-pipeline (useful for verifying an adapter live before committing to a full run).
-
-**If you already ran prefetch and are now calling `run_model.py` directly**
-(rather than through `run_all.sh`, which sets this automatically), export
-`HF_HUB_OFFLINE=1` first:
-```bash
-python scripts/prefetch_model.py --model olmoe
-export HF_HUB_OFFLINE=1   # skip this and from_pretrained() may re-check/re-fetch over the network
-python scripts/run_model.py --model olmoe
-```
-Without this, `from_pretrained()` still makes a small network call even when
-a local file already exists (an etag/HEAD "check for updates" request) — on
-a pod where huggingface_hub's network calls are unreliable, that lightweight
-check can itself hang or trigger a full re-download, which is exactly what
-was observed on 2026-07-03 immediately after a successful curl-based prefetch.
+one from its last checkpoint (export `HF_HOME="$PWD/.hf_cache"` and
+`HF_HUB_OFFLINE=1` first if calling it directly rather than through
+`run_all.sh`, which sets both automatically).
 
 ## Traceability — what's in `results/`
 

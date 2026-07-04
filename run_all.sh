@@ -36,12 +36,24 @@ cd "$(dirname "$0")"
 # transformers/huggingface_hub import happens anywhere in this run.
 export HF_HUB_DISABLE_XET=1
 
-# NOT pinning HF_HOME here deliberately: whatever it already resolves to
-# (e.g. /workspace/.cache/huggingface on this RunPod image) is left alone,
-# so files prefetch_model.py already downloaded there are reused, not
-# re-fetched under a different path. See scripts/run_model.py and the
-# adapters for how the pipeline is told to trust that cache and skip the
-# network entirely once prefetch confirms the files are present.
+# THE ROOT-CAUSE FIX for nearly every infrastructure failure hit on
+# 2026-07-03: RunPod's PyTorch template sets HF_HOME to
+# /workspace/.cache/huggingface — the SHARED, QUOTA-LIMITED, SLOW NETWORK
+# VOLUME. Every model download was silently landing there, which explains:
+#   - "Disk quota exceeded" errors while the container disk sat empty
+#   - downloads hanging at 0% / mid-shard (multi-GB writes onto a slow
+#     network filesystem, through huggingface_hub's downloader)
+#   - very slow curl transfers (bottlenecked by network-mount writes,
+#     not by the connection to HF's CDN)
+#   - stale half-finished cache state (refs/main pointing at snapshot dirs
+#     missing their safetensors) surviving across pod restarts
+# Overriding HF_HOME to a directory inside this repo (which the disk checks
+# below guarantee is on the pod's fast local container disk) fixes all of
+# these at once, and gives every fresh clone a clean cache with no stale
+# refs/ or .no_exist markers left over from previous attempts.
+export HF_HOME="$PWD/.hf_cache"
+mkdir -p "$HF_HOME"
+echo "HF_HOME overridden to $HF_HOME (local disk, not the pod's network volume)"
 
 echo "=== [1/4] Environment checks ==="
 python3 --version
@@ -59,23 +71,19 @@ if ! nvidia-smi > /dev/null 2>&1; then
 fi
 nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
 
-# Warn (don't block — some pods legitimately run everything from a network
-# mount) if the current directory looks like RunPod's shared network volume
-# rather than the pod's own container disk. Downloading ~75GB of model
-# weights onto a quota-limited network mount was the root cause of a
-# "Disk quota exceeded" error on 2026-07-03 even with the container disk
-# almost empty.
+# FATAL (not just a warning) if the repo sits on RunPod's shared network
+# volume: HF_HOME now lives inside this repo, so a network-mounted PWD would
+# put ~75GB of model weights onto the quota-limited, slow shared mount —
+# the exact root cause of the 2026-07-03 "Disk quota exceeded" and
+# hung-download failures. Better to refuse up front than fail hours in.
 CWD_FS=$(df "$PWD" | tail -1)
 if echo "$CWD_FS" | grep -qE "mfs#|nfs|:/workspace|runpod-volume"; then
-    echo ""
-    echo "!!! WARNING: current directory appears to be on a network-mounted filesystem:"
-    echo "    $CWD_FS"
-    echo "!!! Network volumes on RunPod are often quota-limited per user even when the"
-    echo "!!! pool shows huge free space. If this run later fails with 'Disk quota"
-    echo "!!! exceeded', re-clone and run this repo from the pod's local container disk"
-    echo "!!! instead (commonly /root or /)."
-    echo ""
-    sleep 5
+    echo "FATAL: this repo is on a network-mounted filesystem:" >&2
+    echo "    $CWD_FS" >&2
+    echo "Network volumes on RunPod are quota-limited per user and slow for multi-GB" >&2
+    echo "writes. Re-clone and run from the pod's local container disk instead:" >&2
+    echo "    cd /root && git clone <this repo> && cd indic-moe-specialization && bash run_all.sh" >&2
+    exit 1
 fi
 
 AVAIL_GB=$(df --output=avail -BG "$PWD" | tail -1 | tr -dc '0-9')
@@ -90,6 +98,16 @@ echo "Disk check OK: ${AVAIL_GB}GB free at $PWD"
 echo ""
 echo "=== [2/4] Installing dependencies ==="
 pip install -q -r requirements.txt
+
+# aria2c downloads each file over 16 parallel connections — much faster than
+# single-connection curl (which was correct but slow), and it's a separate
+# battle-tested client unaffected by huggingface_hub's downloader problems.
+# Best-effort install: prefetch_model.py falls back to curl if aria2c is
+# unavailable (e.g. no apt access), so this never blocks the run.
+if ! command -v aria2c > /dev/null 2>&1; then
+    echo "Installing aria2 for parallel downloads (falls back to curl if this fails)..."
+    (apt-get update -qq && apt-get install -y -qq aria2) || echo "aria2 install failed — prefetch will use curl (slower but works)"
+fi
 
 echo ""
 echo "=== [3/4] Pre-fetching all model weights (hardened against download hangs) ==="

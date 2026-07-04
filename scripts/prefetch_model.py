@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Pre-download a model's weights into the HF cache BEFORE the main pipeline
-runs, using plain curl subprocesses instead of huggingface_hub's downloader.
+runs, using aria2c (16 parallel connections; falls back to plain curl)
+instead of huggingface_hub's downloader.
 
 Why this exists: on a RunPod RTX 4090 pod (2026-07-03), huggingface_hub's
 downloader — both its "xet" fast-download backend AND its standard HTTP
@@ -87,30 +88,55 @@ def list_repo_files(hf_id: str, revision: str | None) -> list[str]:
     return files
 
 
-def curl_file(url: str, dest: Path) -> bool:
-    """Returns True on success. Uses curl -C - for resume-on-retry (partial
-    files from a killed/timed-out attempt are continued, not restarted)."""
+def _have_aria2() -> bool:
+    import shutil
+    return shutil.which("aria2c") is not None
+
+
+def download_file(url: str, dest: Path) -> bool:
+    """Returns True on success. Prefers aria2c (16 parallel connections per
+    file — single-connection curl was correct but very slow on the pod this
+    was developed against); falls back to curl if aria2c isn't installed.
+    Both paths resume partial downloads across retries rather than restarting."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_dest = dest.with_suffix(dest.suffix + ".partial")
+    use_aria2 = _have_aria2()
 
     for attempt in range(1, MAX_ATTEMPTS_PER_FILE + 1):
-        print(f"    attempt {attempt}/{MAX_ATTEMPTS_PER_FILE}: curl -> {dest.name}")
+        tool = "aria2c" if use_aria2 else "curl"
+        print(f"    attempt {attempt}/{MAX_ATTEMPTS_PER_FILE}: {tool} -> {dest.name}")
         try:
-            result = subprocess.run(
-                ["curl", "-L", "--fail", "--retry", "3", "--retry-delay", "5",
-                 "-C", "-",  # resume partial download if tmp_dest already exists
-                 "-o", str(tmp_dest), url],
-                timeout=CURL_TIMEOUT_SECONDS,
-            )
+            if use_aria2:
+                # -x/-s: 16 connections; -c: resume; --file-allocation=none:
+                # skip slow preallocation; summary every 15s instead of a
+                # progress bar (tmux/log friendly)
+                cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M", "-c",
+                       "--file-allocation=none", "--summary-interval=15",
+                       "--console-log-level=warn", "--download-result=hide",
+                       "-d", str(tmp_dest.parent), "-o", tmp_dest.name, url]
+            else:
+                cmd = ["curl", "-L", "--fail", "--retry", "3", "--retry-delay", "5",
+                       "-C", "-", "-o", str(tmp_dest), url]
+            result = subprocess.run(cmd, timeout=CURL_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             print(f"    attempt {attempt} exceeded {CURL_TIMEOUT_SECONDS}s — killed, retrying "
-                  f"(curl -C - resumes from where this attempt left off, not from scratch)")
+                  f"(partial file is resumed, not restarted)")
             continue
 
         if result.returncode == 0:
+            # aria2c leaves a .aria2 control file next to a completed download
+            # only on failure; remove any stale one defensively
+            control = tmp_dest.parent / (tmp_dest.name + ".aria2")
+            if control.exists():
+                control.unlink()
             tmp_dest.rename(dest)
             return True
-        print(f"    curl exited {result.returncode} — retrying")
+        print(f"    {tool} exited {result.returncode} — retrying")
+        if use_aria2 and attempt >= 2:
+            # aria2c failing twice: drop to curl for the remaining attempts —
+            # slower, but a different client/code path
+            print("    switching to curl fallback for remaining attempts")
+            use_aria2 = False
         time.sleep(min(10 * attempt, 60))
 
     return False
@@ -180,7 +206,7 @@ def prefetch(hf_id: str, revision: str | None):
             print(f"[{hf_id}] {filename}: already cached ({dest.stat().st_size / 1e6:.1f} MB), skipping")
             continue
         url = f"https://huggingface.co/{hf_id}/resolve/{revision or 'main'}/{filename}"
-        ok = curl_file(url, dest)
+        ok = download_file(url, dest)
         if not ok:
             raise RuntimeError(
                 f"[{hf_id}] failed to download {filename} after {MAX_ATTEMPTS_PER_FILE} attempts via curl. "
