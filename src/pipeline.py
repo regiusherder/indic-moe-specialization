@@ -35,6 +35,23 @@ def _adapter_for(name: str):
     raise ValueError(f"Unknown adapter '{name}' — add it to src/adapters/ and register it here.")
 
 
+def _routing_checkpoint_is_valid(loaded, n_routed_experts: int) -> bool:
+    """A cached routing pickle is only reusable if it has soft-routing prob
+    sums AND every per-sentence prob vector is exactly (n_routed_experts,) —
+    i.e. shape-consistent so np.sum(..., axis=0) at stage 4 won't hit the
+    inhomogeneous-array error the DeepSeek hook bug produced (2026-07-04)."""
+    prob_sums = getattr(loaded, "per_sentence_prob_sums", None)
+    if not prob_sums:
+        return False
+    for layer_idx, per_sentence in prob_sums.items():
+        if not per_sentence:
+            return False
+        for vec in per_sentence:
+            if getattr(vec, "shape", None) != (n_routed_experts,):
+                return False
+    return True
+
+
 def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_root: Path):
     model_cfg = config["models"][model_key]
     out_dir = results_root / model_key
@@ -103,14 +120,23 @@ def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_
         if lang_ckpt.exists():
             with open(lang_ckpt, "rb") as f:
                 loaded = pickle.load(f)
-            # Old-format checkpoints (pre soft-routing capture) lack prob sums;
-            # loading one would crash stage 4 deep inside soft_distribution with
-            # an unhelpful error. Detect and re-extract instead.
-            if getattr(loaded, "per_sentence_prob_sums", None):
+            # A cached checkpoint is only trustworthy if (a) it has the
+            # soft-routing prob sums at all (old pre-soft-metric format lacks
+            # them) AND (b) those prob sums are shape-consistent per layer — a
+            # ragged set of per-sentence vectors crashes stage 4 inside
+            # soft_distribution with an inhomogeneous-array error. The DeepSeek
+            # hook bug (fixed 2026-07-04) produced exactly such ragged pickles;
+            # validating here means a `git pull` + re-run auto-discards the bad
+            # DeepSeek pickles and re-extracts them, without touching already-
+            # complete models (OLMoE/Qwen are skipped by the top-level guard
+            # before this code ever runs) and without manual pkl deletion.
+            if _routing_checkpoint_is_valid(loaded, adapter.num_routed_experts):
                 records[lang_name] = loaded
                 print(f"  [resume] {lang_name}: routing already extracted, loaded from checkpoint")
                 continue
-            print(f"  [resume] {lang_name}: checkpoint is old-format (no soft-routing data) — re-extracting")
+            print(f"  [resume] {lang_name}: checkpoint is stale/invalid (missing or "
+                  f"ragged soft-routing data) — deleting and re-extracting")
+            lang_ckpt.unlink()
             lang_ckpt.unlink()
 
         print(f"  Extracting routing for {lang_name} ...")

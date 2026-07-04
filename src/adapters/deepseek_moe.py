@@ -83,9 +83,27 @@ class DeepSeekMoEAdapter(MoEAdapter):
             # recompute them from the router's raw logits via the module's own
             # weight matrix applied to the hook's input — this mirrors the
             # official repo's `self.weight` Linear-less matmul router.
+            #
+            # DeepSeek's MoEGate reshapes hidden states to (batch*seq_len,
+            # hidden_dim) internally, so inputs[0] here is already 2D
+            # (n_tokens, hidden_dim) and F.linear -> (n_tokens, n_routed_experts).
+            # But we normalize defensively: flatten any leading dims so the
+            # result is always (n_tokens, n_routed_experts), guaranteeing
+            # probs.sum(dim=0) is a fixed (n_routed_experts,) vector for EVERY
+            # sentence regardless of length/shape. Without this, sentences whose
+            # hidden_states came through with an extra leading batch dim
+            # produced variable-width prob vectors, which broke soft_distribution
+            # with an inhomogeneous-array error at stage 4 (hit live 2026-07-04).
             hidden_states = inputs[0].detach().float()
+            hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
             logits = F.linear(hidden_states, module.weight.float())
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(logits, dim=-1)  # (n_tokens, n_routed_experts)
+            if probs.shape[-1] != self.num_routed_experts:
+                raise RuntimeError(
+                    f"DeepSeek gate hook at layer {layer_idx} produced {probs.shape[-1]} "
+                    f"routing probs but config says n_routed_experts={self.num_routed_experts}. "
+                    f"The gate weight shape doesn't match — inspect modeling_deepseek.py's MoEGate."
+                )
             topk_idx = output[0].detach().cpu()
             self._captures[layer_idx] = RoutingCapture(
                 layer_idx=layer_idx,
