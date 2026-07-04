@@ -86,14 +86,20 @@ if echo "$CWD_FS" | grep -qE "mfs#|nfs|:/workspace|runpod-volume"; then
     exit 1
 fi
 
+# The ~100GB requirement counts data ALREADY in the local cache toward the
+# total — otherwise a resumed run whose models are fully downloaded (~75GB
+# in .hf_cache) fails the check precisely BECAUSE the downloads succeeded.
 AVAIL_GB=$(df --output=avail -BG "$PWD" | tail -1 | tr -dc '0-9')
-if [ "${AVAIL_GB:-0}" -lt 100 ]; then
-    echo "FATAL: only ${AVAIL_GB}GB free at $PWD. This study needs ~100GB+ (three" >&2
-    echo "models cached simultaneously at ~14+28+33GB, plus FLORES, results, and" >&2
-    echo "working headroom). Resize the volume before running." >&2
+CACHED_GB=$(du -s -BG "$HF_HOME" 2>/dev/null | cut -f1 | tr -dc '0-9')
+CACHED_GB=${CACHED_GB:-0}
+EFFECTIVE_GB=$((AVAIL_GB + CACHED_GB))
+if [ "$EFFECTIVE_GB" -lt 100 ]; then
+    echo "FATAL: ${AVAIL_GB}GB free + ${CACHED_GB}GB already cached = ${EFFECTIVE_GB}GB at $PWD." >&2
+    echo "This study needs ~100GB total (three models at ~14+28+33GB, plus FLORES," >&2
+    echo "results, and working headroom). Resize the volume before running." >&2
     exit 1
 fi
-echo "Disk check OK: ${AVAIL_GB}GB free at $PWD"
+echo "Disk check OK: ${AVAIL_GB}GB free + ${CACHED_GB}GB already cached (${EFFECTIVE_GB}GB effective)"
 
 echo ""
 echo "=== [2/4] Installing dependencies ==="
