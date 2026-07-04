@@ -107,10 +107,18 @@ def download_file(url: str, dest: Path) -> bool:
         print(f"    attempt {attempt}/{MAX_ATTEMPTS_PER_FILE}: {tool} -> {dest.name}")
         try:
             if use_aria2:
-                # -x/-s: 16 connections; -c: resume; --file-allocation=none:
-                # skip slow preallocation; summary every 15s instead of a
-                # progress bar (tmux/log friendly)
-                cmd = ["aria2c", "-x", "16", "-s", "16", "-k", "1M", "-c",
+                # -x/-s 4: HF's CDN issues pre-signed redirect URLs locked to a
+                # specific byte range; with many parallel connections, the ones
+                # that don't match their URL's signed range get 403'd (observed
+                # live 2026-07-04 — downloads still completed via retry, but
+                # noisily and with degraded parallelism). 4 connections keeps
+                # most of the speed with far fewer signed-range rejections;
+                # actual observed throughput was write-bound, not
+                # connection-bound, once HF_HOME moved to local disk.
+                # -c: resume; --file-allocation=none: skip slow preallocation;
+                # summary lines instead of a progress bar (tmux/log friendly)
+                cmd = ["aria2c", "-x", "4", "-s", "4", "-k", "1M", "-c",
+                       "--retry-wait=2", "--max-tries=15",
                        "--file-allocation=none", "--summary-interval=15",
                        "--console-log-level=warn", "--download-result=hide",
                        "-d", str(tmp_dest.parent), "-o", tmp_dest.name, url]
