@@ -94,7 +94,14 @@ def build_token_capped_sample(
     n_tokens = 0
     for sentence in sentences:
         candidate = (text + " " + sentence).strip() if text else sentence
-        candidate_tokens = len(tokenizer(candidate, add_special_tokens=False)["input_ids"])
+        # This call only counts tokens toward the budget below — it never
+        # feeds `candidate` through the model — but the growing string can
+        # legitimately exceed a model's max_position_embeddings mid-loop
+        # (observed: DeepSeek's tokenizer warns at 16396 > 16384) before this
+        # function's own max_tokens cap (e.g. 20000) is reached. verbose=False
+        # silences that harmless warning; truncation is irrelevant here since
+        # we only read len(input_ids), never decode/forward this tensor.
+        candidate_tokens = len(tokenizer(candidate, add_special_tokens=False, verbose=False)["input_ids"])
         if candidate_tokens > max_tokens and n_sentences > 0:
             break
         text = candidate
