@@ -50,8 +50,22 @@ class LanguageRoutingRecord:
 
 def expert_distribution(selected_indices: np.ndarray, n_experts: int) -> np.ndarray:
     """selected_indices: (n_tokens, top_k) -> normalized bincount over n_experts."""
-    flat = selected_indices.flatten()
+    flat = np.asarray(selected_indices).flatten()
+    if flat.size == 0:
+        raise ValueError("No routing decisions recorded — check hook wiring before trusting any output.")
+    # bounds guard: an out-of-range index would make bincount return an array
+    # of a DIFFERENT length than n_experts, which then misaligns / crashes the
+    # cross-language JSD. This must never happen (top-k indices are in
+    # [0, n_experts)); fail loud if it does rather than compute silently-wrong JSD.
+    lo, hi = int(flat.min()), int(flat.max())
+    if lo < 0 or hi >= n_experts:
+        raise ValueError(
+            f"selected expert index out of range: got [{lo}, {hi}] but n_experts={n_experts}. "
+            f"The adapter's selected_experts are not plain routed-expert indices -- "
+            f"routing distributions would be misaligned across languages.")
     counts = np.bincount(flat, minlength=n_experts).astype(float)
+    # minlength guarantees len>=n_experts; the bounds check guarantees len==n_experts
+    counts = counts[:n_experts]
     total = counts.sum()
     if total == 0:
         raise ValueError("No routing decisions recorded — check hook wiring before trusting any output.")
@@ -62,7 +76,16 @@ def jsd(p: np.ndarray, q: np.ndarray) -> float:
     """Squared Jensen-Shannon divergence in bits (base 2). scipy's
     jensenshannon returns the DISTANCE (sqrt of divergence) — squaring here
     is required or every downstream number is silently wrong by a sqrt."""
-    return float(jensenshannon(p, q, base=2) ** 2)
+    if len(p) != len(q):
+        raise ValueError(f"JSD on mismatched-length distributions ({len(p)} vs {len(q)}) -- "
+                         f"expert-index spaces differ across languages, results would be meaningless.")
+    d = float(jensenshannon(p, q, base=2) ** 2)
+    if not np.isfinite(d):
+        # scipy returns nan for degenerate inputs; our upstream guards should
+        # prevent this, so surface it rather than silently poisoning permutation
+        # p-values (which compare >= against a nan observed value).
+        raise ValueError("JSD is non-finite -- degenerate routing distribution reached the metric.")
+    return d
 
 
 def soft_distribution(record: LanguageRoutingRecord, layer_idx: int) -> np.ndarray:
@@ -72,8 +95,13 @@ def soft_distribution(record: LanguageRoutingRecord, layer_idx: int) -> np.ndarr
     if n_tokens == 0:
         raise ValueError("No tokens recorded — check hook wiring before trusting any output.")
     dist = total / n_tokens
+    s = dist.sum()
+    if not np.isfinite(s) or s <= 0:
+        raise ValueError(
+            f"soft routing distribution has non-positive/non-finite sum ({s}) at layer "
+            f"{layer_idx} for '{record.language}' -- corrupt prob sums, refusing to normalize.")
     # each token's softmax sums to 1, so dist should too (up to float error)
-    return dist / dist.sum()
+    return dist / s
 
 
 def pairwise_jsd_matrix(

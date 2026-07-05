@@ -292,6 +292,33 @@ def run_ablation_study(
     _some_sents = next(iter(test_sentences.values()))
     verify_batched_loss(adapter.model, adapter.tokenizer, _some_sents, perplexity_max_tokens, batch_size=loss_batch_size)
 
+    # one-time EFFECTIVENESS check: confirm the ablation hooks actually change
+    # the loss. If a hook silently didn't fire (wrong module path, etc.), every
+    # delta would be ~0 and the whole causal experiment would be meaningless
+    # noise -- worse than crashing, because it looks like a real null result.
+    # Ablate a big chunk of experts on every MoE layer and require the loss to
+    # move appreciably.
+    _check_sents = [s for s in _some_sents if len(s.split()) >= 3][:8] or _some_sents[:8]
+    _base_check = per_sentence_losses(adapter.model, adapter.tokenizer, _check_sents, perplexity_max_tokens, batch_size=loss_batch_size)
+    # ablate each layer's MOST-USED experts (by overall usage), not arbitrary
+    # low-numbered ones -- ablating rarely-used experts might not move the loss
+    # even when the hooks work, which would make this check unreliable.
+    _probe_lang = next(iter(per_lang_layer_dist))
+    _n_probe = min(adapter.num_routed_experts, max(top_n_sweep) * 2)
+    _big = {layer: np.argsort(-per_lang_layer_dist[_probe_lang][layer])[:_n_probe].tolist()
+            for layer in layers_with_moe}
+    with adapter.ablate_experts(_big):
+        _abl_check = per_sentence_losses(adapter.model, adapter.tokenizer, _check_sents, perplexity_max_tokens, batch_size=loss_batch_size)
+    _mean_shift = float(np.mean(np.abs(_abl_check - _base_check))) if len(_abl_check) == len(_base_check) else -1
+    if _mean_shift < 1e-4:
+        raise RuntimeError(
+            f"Ablating {len(_big[layers_with_moe[0]])} experts/layer barely changed the loss "
+            f"(mean |delta|={_mean_shift:.2e}). The ablation hooks are likely NOT firing / not "
+            f"suppressing experts -- every ablation number would be a false null. Refusing to "
+            f"proceed. Check the adapter's ablate_experts hook path against the live model.")
+    print(f"    [ok] ablation is effective (ablating a large expert set shifts loss by "
+          f"mean |delta|={_mean_shift:.3f} on a probe) -- hooks are firing.")
+
     # baseline per-sentence losses (no ablation), once per language
     print(f"    computing baselines for {len(langs)} languages ...")
     baseline = {}

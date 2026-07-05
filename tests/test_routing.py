@@ -76,6 +76,27 @@ def test_expert_distribution_sums_to_one():
     assert d[0] == d[1] == 2 / 6
 
 
+def test_expert_distribution_rejects_out_of_range_index():
+    # an index >= n_experts must fail loud, not silently make a longer vector
+    bad = np.array([[0, 1], [2, N_EXPERTS]])  # N_EXPERTS is out of range (valid: 0..N_EXPERTS-1)
+    try:
+        expert_distribution(bad, N_EXPERTS)
+        assert False, "expected out-of-range index to raise"
+    except ValueError:
+        pass
+    # length is always exactly n_experts even when high indices are absent
+    d = expert_distribution(np.array([[0, 1]]), N_EXPERTS)
+    assert len(d) == N_EXPERTS
+
+
+def test_jsd_rejects_mismatched_lengths():
+    try:
+        jsd(np.ones(4) / 4, np.ones(5) / 5)
+        assert False, "expected mismatched-length JSD to raise"
+    except ValueError:
+        pass
+
+
 def test_permutation_null_no_difference():
     """Same generating process for both 'languages' -> p should NOT be small."""
     rng = np.random.default_rng(1)

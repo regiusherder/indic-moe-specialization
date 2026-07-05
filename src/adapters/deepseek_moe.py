@@ -68,6 +68,18 @@ class DeepSeekMoEAdapter(MoEAdapter):
                 "Inspect the cached modeling_deepseek.py and update this adapter before proceeding."
             )
 
+        # The capture hook reconstructs routing probs as softmax(gate_logits).
+        # DeepSeek's MoEGate has a `scoring_func` config field; deepseek-moe-16b
+        # uses "softmax". If a variant used e.g. "sigmoid", our reconstructed
+        # probs would be silently wrong -- so verify the assumption holds.
+        scoring = getattr(self.model.config, "scoring_func", "softmax")
+        if scoring != "softmax":
+            raise RuntimeError(
+                f"DeepSeek gate scoring_func is '{scoring}', but the capture hook "
+                f"reconstructs probs as softmax(logits). Update _make_hook to match "
+                f"'{scoring}' scoring before trusting the routing_probs (soft metric)."
+            )
+
     def register_hooks(self) -> list:
         handles = []
         for i, layer in enumerate(self.model.model.layers):
