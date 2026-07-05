@@ -119,13 +119,18 @@ all figures are in [`results/figures/`](results/figures/).
   decisions and inflate their apparent divergence. Equal tokens gives every
   language equally-precise routing distributions and closes that confound.
 
-- **Tokenization sanity check.** Before trusting any routing result, we
+- **Tokenization integrity check.** Before trusting any routing result, we
   verified every model's tokenizer actually encodes each of the 11 languages
-  into real subwords rather than collapsing whole scripts to `<unk>` (which
-  would make "routing" reflect the model choking on unknown tokens, not
-  genuine processing). Result: **0.0000% `<unk>` tokens, all 11 languages,
-  all 3 models** — reproducible via `scripts/verify_tokenization.py`, full
-  log in [`results/figures/tokenization_audit.txt`](results/figures/tokenization_audit.txt).
+  into real subwords, checking for three failure modes on the exact text each
+  model was fed: `<unk>` tokens, leaked control tokens (e.g. `<|endoftext|>`
+  appearing mid-text), and Unicode replacement characters (a sign of failed
+  byte-fallback). Result: **33/33 language×model combinations clean** — the
+  only flag anywhere is 3 replacement characters (0.015% of tokens) in
+  DeepSeek's *English* sample, traced to em-dash/en-dash punctuation in the
+  source FLORES-200 text, with zero occurrences in any of the 10 Indic
+  languages the study measures. Reproducible via
+  `scripts/verify_tokenization.py`; full log in
+  [`results/figures/tokenization_audit.txt`](results/figures/tokenization_audit.txt).
 
 - **Routing extraction.** PyTorch forward hooks on each layer's router capture,
   per token, the full softmax over **routed** experts and the top-k selection.
