@@ -50,6 +50,34 @@ Measured across **OLMoE-1B-7B** (64 experts, no shared, English-heavy training),
    experts, in 5 of 6 Indic cases — evidence that these experts causally carry
    these languages, not merely correlate with them.
 
+### The numbers
+
+**Family-structured routing** (mean JSD across layers; lower within-family than
+cross-family means the router separates the two Indic families):
+
+| Model | within-family JSD | cross-family JSD | ratio | median effect size |
+|---|---|---|---|---|
+| OLMoE | 0.0217 | 0.0386 | **0.56** | 90 SD |
+| Qwen1.5-MoE | 0.0451 | 0.0540 | 0.84 | 113 SD |
+| deepseek-moe-16b | 0.0429 | 0.0511 | 0.84 | 73 SD |
+
+Effect sizes are standard deviations above the **sentence-level** permutation
+null (the honest unit; token-level nulls overstate significance). All 55
+language pairs are significant at p<0.05 in every model.
+
+**The Hindi–Urdu control** (same spoken language, different script — isolates
+language identity from orthography):
+
+| Model | Hindi–Urdu JSD | Hindi vs other Indo-Aryan (mean) | ratio | verdict |
+|---|---|---|---|---|
+| OLMoE | 0.0148 | 0.0262 | **0.56** | language identity > script |
+| Qwen1.5-MoE | 0.0484 | 0.0306 | 1.58 | script dominates |
+| deepseek-moe-16b | 0.0367 | 0.0394 | 0.93 | roughly tied |
+
+A ratio below 1 means Urdu routes *closer* to Hindi than Hindi's own family
+relatives do — i.e. routing follows language, not script. The English-heavy
+OLMoE shows this most strongly; the multilingual Qwen shows the opposite.
+
 Full numbers are in [`results/figures/findings_summary.txt`](results/figures/findings_summary.txt);
 all figures are in [`results/figures/`](results/figures/).
 
