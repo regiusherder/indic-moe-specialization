@@ -73,18 +73,18 @@ def reorder(mat, lang_order, target=ORDER):
 
 def fig_heatmap(mean_jsd, lang_order, model, out: Path):
     m, names = reorder(mean_jsd, lang_order)
-    fig, ax = plt.subplots(figsize=(9, 7.5))
+    fig, ax = plt.subplots(figsize=(10, 8.5))
     im = ax.imshow(m, cmap="viridis")
-    ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=45, ha="right")
-    ax.set_yticks(range(len(names))); ax.set_yticklabels(names)
+    ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=45, ha="right", fontsize=10)
+    ax.set_yticks(range(len(names))); ax.set_yticklabels(names, fontsize=10)
     for i in range(len(names)):
         for j in range(len(names)):
             ax.text(j, i, f"{m[i,j]:.3f}", ha="center", va="center",
-                    color="white" if m[i, j] < m.max() * 0.6 else "black", fontsize=7)
+                    color="white" if m[i, j] < m.max() * 0.6 else "black", fontsize=8)
     fig.colorbar(im, ax=ax, label="mean JSD across layers")
     ax.set_title(f"{model}: routing-distribution JSD between languages\n(hard top-k, averaged over layers)")
     fig.tight_layout()
-    fig.savefig(out / f"jsd_heatmap_{model}.png", dpi=150)
+    fig.savefig(out / f"jsd_heatmap_{model}.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -100,13 +100,14 @@ def fig_dendrogram(mean_jsd, lang_order, model, out: Path):
     np.fill_diagonal(m, 0.0)
     condensed = squareform(m, checks=False)  # (n,n) square -> length n*(n-1)/2 vector
     Z = linkage(condensed, method="average")
-    fig, ax = plt.subplots(figsize=(9, 5))
-    dendrogram(Z, labels=names, ax=ax)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    dendrogram(Z, labels=names, ax=ax, leaf_rotation=45, leaf_font_size=11)
     ax.set_ylabel("JSD (average linkage)")
     ax.set_title(f"{model}: language clustering by routing similarity\n"
                  f"(Dravidian vs Indo-Aryan; does Urdu sit with Hindi or apart?)")
+    fig.subplots_adjust(bottom=0.18)  # room for rotated labels
     fig.tight_layout()
-    fig.savefig(out / f"dendrogram_{model}.png", dpi=150)
+    fig.savefig(out / f"dendrogram_{model}.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -114,7 +115,7 @@ def fig_layerwise(hard, lang_order, layers, model, out: Path):
     if "english" not in lang_order:
         return
     eng = lang_order.index("english")
-    fig, ax = plt.subplots(figsize=(10, 5.5))
+    fig, ax = plt.subplots(figsize=(12, 6))
     for lang in ORDER:
         if lang not in lang_order or lang == "english":
             continue
@@ -123,9 +124,10 @@ def fig_layerwise(hard, lang_order, layers, model, out: Path):
         ax.plot(layers, hard[:, eng, i], marker="o", ms=3, color=color, alpha=0.75, label=lang)
     ax.set_xlabel("layer"); ax.set_ylabel("JSD vs English")
     ax.set_title(f"{model}: layer-wise routing divergence from English\n(blue=Indo-Aryan, red=Dravidian)")
-    ax.legend(fontsize=7, ncol=2)
+    # legend outside the plot area so it never overlaps the lines
+    ax.legend(fontsize=9, ncol=1, loc="center left", bbox_to_anchor=(1.01, 0.5))
     fig.tight_layout()
-    fig.savefig(out / f"layerwise_{model}.png", dpi=150)
+    fig.savefig(out / f"layerwise_{model}.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -172,7 +174,7 @@ def fig_hindi_urdu(df, out: Path):
                  "(Hindi-Urdu lower => routing tracks language, not script)")
     ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(out / "hindi_urdu_control.png", dpi=150)
+    fig.savefig(out / "hindi_urdu_control.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -236,7 +238,7 @@ def ablation_analysis(results: Path, summary: list, out: Path):
         ax.set_title(f"{model}: expert-ablation loss deltas by language family")
         ax.legend(fontsize=7)
         fig.tight_layout()
-        fig.savefig(out / f"ablation_{model}.png", dpi=150)
+        fig.savefig(out / f"ablation_{model}.png", dpi=600, bbox_inches="tight")
         plt.close(fig)
 
 
