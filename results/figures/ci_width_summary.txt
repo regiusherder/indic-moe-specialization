@@ -1,0 +1,56 @@
+==============================================================================
+olmoe: bootstrap CI width sanity check (mean across layers)
+==============================================================================
+  overall mean relative CI width (width / point estimate): 0.135
+
+  5 WIDEST (least precise) pairs:
+    hindi      -marathi     point=0.0149 ci_width=0.0036 rel_width=0.25
+    gujarati   -punjabi     point=0.0212 ci_width=0.0028 rel_width=0.25
+    telugu     -malayalam   point=0.0155 ci_width=0.0023 rel_width=0.22
+    bengali    -gujarati    point=0.0149 ci_width=0.0021 rel_width=0.22
+    telugu     -kannada     point=0.0156 ci_width=0.0020 rel_width=0.21
+
+  5 TIGHTEST (most precise) pairs:
+    english    -malayalam   point=0.4750 ci_width=0.0166 rel_width=0.04
+    english    -kannada     point=0.4705 ci_width=0.0169 rel_width=0.04
+    english    -telugu      point=0.4634 ci_width=0.0168 rel_width=0.04
+    english    -tamil       point=0.4559 ci_width=0.0167 rel_width=0.04
+    english    -gujarati    point=0.4241 ci_width=0.0158 rel_width=0.04
+
+==============================================================================
+qwen_moe: bootstrap CI width sanity check (mean across layers)
+==============================================================================
+  overall mean relative CI width (width / point estimate): 0.113
+
+  5 WIDEST (least precise) pairs:
+    hindi      -bengali     point=0.0161 ci_width=0.0030 rel_width=0.24
+    hindi      -marathi     point=0.0168 ci_width=0.0037 rel_width=0.23
+    marathi    -bengali     point=0.0228 ci_width=0.0037 rel_width=0.18
+    bengali    -tamil       point=0.0317 ci_width=0.0043 rel_width=0.15
+    hindi      -tamil       point=0.0375 ci_width=0.0050 rel_width=0.15
+
+  5 TIGHTEST (most precise) pairs:
+    english    -kannada     point=0.1710 ci_width=0.0102 rel_width=0.06
+    english    -telugu      point=0.1703 ci_width=0.0102 rel_width=0.06
+    english    -punjabi     point=0.1809 ci_width=0.0110 rel_width=0.06
+    english    -urdu        point=0.1770 ci_width=0.0107 rel_width=0.07
+    english    -marathi     point=0.1533 ci_width=0.0098 rel_width=0.07
+
+==============================================================================
+deepseek_moe: bootstrap CI width sanity check (mean across layers)
+==============================================================================
+  overall mean relative CI width (width / point estimate): 0.122
+
+  5 WIDEST (least precise) pairs:
+    hindi      -marathi     point=0.0250 ci_width=0.0055 rel_width=0.23
+    telugu     -kannada     point=0.0153 ci_width=0.0026 rel_width=0.21
+    telugu     -malayalam   point=0.0197 ci_width=0.0031 rel_width=0.19
+    malayalam  -kannada     point=0.0206 ci_width=0.0029 rel_width=0.19
+    bengali    -tamil       point=0.0246 ci_width=0.0039 rel_width=0.18
+
+  5 TIGHTEST (most precise) pairs:
+    english    -marathi     point=0.1892 ci_width=0.0115 rel_width=0.06
+    english    -urdu        point=0.1777 ci_width=0.0110 rel_width=0.06
+    english    -punjabi     point=0.1496 ci_width=0.0101 rel_width=0.07
+    english    -gujarati    point=0.1243 ci_width=0.0089 rel_width=0.07
+    english    -malayalam   point=0.1242 ci_width=0.0088 rel_width=0.07

@@ -51,7 +51,7 @@ ORDER = ["english",
 
 
 def load_jsd(results: Path, model: str):
-    data = json.loads((results / model / "03_analysis" / "jsd_by_layer.json").read_text())
+    data = json.loads((results / model / "03_analysis" / "jsd_by_layer.json").read_text(encoding="utf-8"))
     # keys are stringified layer indices
     layers = sorted(data.keys(), key=lambda k: int(k))
     lang_order = data[layers[0]]["lang_order"]
@@ -203,17 +203,31 @@ def family_clustering_score(results: Path, summary: list):
 
 def ablation_analysis(results: Path, summary: list, out: Path):
     """Targeted (family-preferring experts ablated) vs random-control ablation.
-    The causal claim holds if ablating a family's experts hurts THAT family's
-    languages more than random experts do, and more than it hurts other families."""
+
+    IMPORTANT correction (2026-07-05): Test A originally compared each family's
+    targeted-ablation delta against a single POOLED random-control baseline
+    (averaged across ALL languages, including English). That's an
+    apples-to-oranges comparison: different languages have very different
+    baseline sensitivity to ANY ablation (observed range 0.16-0.57 loss delta
+    across languages, just from random experts) — English in particular has a
+    much lower random-control baseline than the Indic languages, which can
+    make a family's targeted effect look "specific" purely because the pooled
+    baseline undershoots what that family would show even under RANDOM
+    ablation. Test A now compares against the random-control baseline
+    restricted to the SAME family's languages, which is the correct
+    apples-to-apples comparison.
+
+    Test B (own family vs the OTHER Indic family, both under the SAME
+    targeted-ablation condition) was always apples-to-apples and needed no
+    correction — it remains the stronger, cleaner specificity test.
+    """
     summary.append("\n" + "=" * 70)
     summary.append("CAUSAL ABLATION (targeted family experts vs random controls)")
     summary.append("=" * 70)
     for model in MODELS:
         df = pd.read_csv(results / model / "04_ablation" / "ablation_results.csv")
         summary.append(f"\n{model}:")
-        # random-control baseline: mean loss increase from ablating random experts
-        rand = df[df["condition"] == "random_control"]["delta_vs_baseline"].mean()
-        summary.append(f"  random-control mean delta (random experts, same count): {rand:.4f}")
+        rand_df = df[df["condition"] == "random_control"]
         targeted = df[df["condition"] == "targeted"]
         groups = sorted(targeted["group"].dropna().unique())
         fig, ax = plt.subplots(figsize=(9, 5))
@@ -226,14 +240,17 @@ def ablation_analysis(results: Path, summary: list, out: Path):
                 sub = targeted[(targeted["group"] == group) & (targeted["family"] == fam)]
                 deltas.append(sub["delta_vs_baseline"].mean() if len(sub) else 0.0)
             ax.bar(xpos + gi * width, deltas, width, label=f"ablate {group} experts")
-            # Test A: does ablating this group's experts hit its own family
-            # harder than RANDOM experts of the same count?
+
+            # Test A (corrected): own-family targeted delta vs the random-control
+            # baseline computed ONLY over that same family's languages (not
+            # pooled across all languages, which biases the comparison).
             own = targeted[(targeted["group"] == group) & (targeted["family"] == group)]["delta_vs_baseline"].mean()
+            rand_same_fam = rand_df[rand_df["family"] == group]["delta_vs_baseline"].mean()
             summary.append(f"  ablating {group}-preferring experts -> mean delta on {group} langs: "
-                           f"{own:.4f} (random baseline {rand:.4f}; "
-                           f"{'SPECIFIC vs random' if own > rand else 'NOT above random'})")
-            # Test B (stronger): does it hit its own family harder than the OTHER
-            # Indic family? Only meaningful for the two Indic families.
+                           f"{own:.4f} (random baseline, {group} languages only: {rand_same_fam:.4f}; "
+                           f"{'SPECIFIC vs random' if own > rand_same_fam else 'NOT above random'})")
+            # Test B (own family vs the OTHER Indic family, same condition — no
+            # baseline-choice ambiguity, the cleanest test we have).
             if group in ("Indo-Aryan", "Dravidian"):
                 other_fam = "Dravidian" if group == "Indo-Aryan" else "Indo-Aryan"
                 on_other = targeted[(targeted["group"] == group) & (targeted["family"] == other_fam)]["delta_vs_baseline"].mean()
@@ -241,9 +258,15 @@ def ablation_analysis(results: Path, summary: list, out: Path):
                 summary.append(f"      vs other family ({other_fam}): {on_other:.4f}  "
                                f"differential={diff:+.4f} "
                                f"({'family-specific' if diff > 0 else 'NOT family-specific'})")
+        # per-family random-control baseline markers (not one pooled line —
+        # different families have different baseline sensitivity to ANY
+        # ablation, so a single pooled reference line would be misleading here)
+        for fi, fam in enumerate(fams):
+            rand_fam = rand_df[rand_df["family"] == fam]["delta_vs_baseline"].mean()
+            ax.plot([fi - 0.4, fi + 0.4], [rand_fam, rand_fam], "k--", lw=1.2,
+                    label="random-control (per family)" if fi == 0 else None)
         ax.set_xticks(xpos + width * (len(groups)-1) / 2)
         ax.set_xticklabels(fams)
-        ax.axhline(rand, ls="--", color="k", lw=1, label="random-control mean")
         ax.set_ylabel("mean loss increase vs baseline")
         ax.set_title(f"{model}: expert-ablation loss deltas by language family")
         ax.legend(fontsize=7)
@@ -266,9 +289,11 @@ def significance_summary(results: Path, summary: list):
         alpha = 0.05
         pairs = sent.groupby(["lang_a", "lang_b"])
         any_sig = pairs["p_value"].min().lt(alpha).mean()
+        all_sig = pairs["p_value"].max().lt(alpha).mean()
         med_eff = sent["effect_size_sd"].median()
         summary.append(f"\n{model}:")
         summary.append(f"  pairs significant (p<{alpha}) at >=1 layer: {any_sig*100:.0f}%")
+        summary.append(f"  pairs significant (p<{alpha}) at ALL layers: {all_sig*100:.0f}%")
         summary.append(f"  median effect size (sentence-level): {med_eff:.1f} SD above null")
 
 
@@ -306,7 +331,7 @@ def main():
     ablation_analysis(results, summary, out)
 
     text = "\n".join(summary)
-    (out / "findings_summary.txt").write_text(text)
+    (out / "findings_summary.txt").write_text(text, encoding="utf-8")
     print(text)
     print(f"\n\nFigures + findings_summary.txt written to {out.resolve()}")
 

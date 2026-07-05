@@ -70,14 +70,29 @@ Measured across **OLMoE-1B-7B** (64 experts, no shared, English-heavy training),
    and overall divergence rises toward the final layers; Qwen is noisier with a
    sharp late-layer jump; DeepSeek shows the reversed family ordering.
 
-4. **Ablation gives causal backing.** Two specificity tests, both supportive:
-   ablating a family's most-preferred experts hurts that family's languages
-   more than ablating the same number of *random* experts in 5 of 6 Indic cases
-   (the exception is DeepSeek's Dravidian experts, whose random baseline is
-   unusually high); and on the stronger cross-family test — does ablating family
-   F hurt F more than the *other* family? — the differential is positive in
-   **all 6 cases**. Together this is evidence that these experts causally carry
-   these languages, not merely correlate with them.
+4. **Ablation gives causal backing — but read this one carefully, we corrected
+   it mid-audit.** Two tests, and they disagree in an informative way:
+   - **vs. random experts, same-family baseline** (ablate family F's
+     preferred experts; is F hurt more than F's languages are hurt by
+     ablating *random* experts?): **specific in 8 of 9 cases** — every family
+     in every model except DeepSeek's Dravidian group. *Caveat:* English
+     (Indo-European, a single language) also passes this test in all 3
+     models, which weakens how discriminating the test is — with only one
+     member, "ablate English's own top experts" is close to "ablate whatever
+     this specific language happens to prefer," so passing isn't strong
+     evidence of *family-level* organization the way it is for the 6-language
+     Indo-Aryan or 4-language Dravidian groups.
+   - **vs. the other Indic family** (does ablating family F hurt F more than
+     it hurts the *other* Indic family, under the same ablation?) — this is
+     the cleaner test, immune to the baseline-choice problem above, and it is
+     positive in **all 6 Indic cases**, including DeepSeek's Dravidian group.
+
+   Read together: the *direction* is consistently family-specific (Test 2,
+   the more trustworthy one, is clean 6/6), but the *strength* varies a lot
+   by model and family (OLMoE's Dravidian differential is a small +0.03;
+   Qwen's is a much larger +0.35) — this is evidence of causal, family-linked
+   experts, not proof that every family is equally cleanly separated in every
+   architecture.
 
 ### The numbers
 

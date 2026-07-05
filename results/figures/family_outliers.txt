@@ -1,0 +1,53 @@
+==============================================================================
+olmoe: per-language distance to own-family centroid
+==============================================================================
+
+  Indo-Aryan: mean-to-family-mates (family average = 0.0240)
+    punjabi     0.0289  <-- FURTHEST from own family
+    urdu        0.0250
+    hindi       0.0239
+    gujarati    0.0237
+    bengali     0.0216
+    marathi     0.0209
+
+  Dravidian: mean-to-family-mates (family average = 0.0160)
+    kannada     0.0171  <-- FURTHEST from own family
+    tamil       0.0163
+    malayalam   0.0156
+    telugu      0.0152
+
+==============================================================================
+qwen_moe: per-language distance to own-family centroid
+==============================================================================
+
+  Indo-Aryan: mean-to-family-mates (family average = 0.0467)
+    urdu        0.0686  <-- FURTHEST from own family
+    punjabi     0.0545
+    gujarati    0.0495
+    marathi     0.0369
+    bengali     0.0364
+    hindi       0.0341
+
+  Dravidian: mean-to-family-mates (family average = 0.0412)
+    telugu      0.0417  <-- FURTHEST from own family
+    kannada     0.0417
+    tamil       0.0408
+    malayalam   0.0406
+
+==============================================================================
+deepseek_moe: per-language distance to own-family centroid
+==============================================================================
+
+  Indo-Aryan: mean-to-family-mates (family average = 0.0503)
+    punjabi     0.0665  <-- FURTHEST from own family
+    urdu        0.0579
+    marathi     0.0493
+    gujarati    0.0473
+    bengali     0.0418
+    hindi       0.0389
+
+  Dravidian: mean-to-family-mates (family average = 0.0245)
+    tamil       0.0304  <-- FURTHEST from own family
+    malayalam   0.0241
+    kannada     0.0224
+    telugu      0.0210

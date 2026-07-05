@@ -1,0 +1,107 @@
+==============================================================================
+olmoe: full pairwise JSD, Indic languages only, grouped by family
+==============================================================================
+
+  -- within Indo-Aryan (6 languages) --
+    hindi       - urdu        0.0148
+    hindi       - marathi     0.0149
+    bengali     - gujarati    0.0149
+    marathi     - bengali     0.0173
+    marathi     - urdu        0.0208
+    marathi     - gujarati    0.0209
+    gujarati    - punjabi     0.0212
+    hindi       - bengali     0.0243
+    bengali     - punjabi     0.0253
+    bengali     - urdu        0.0261
+    hindi       - gujarati    0.0303
+    marathi     - punjabi     0.0307
+    gujarati    - urdu        0.0312
+    punjabi     - urdu        0.0323
+    hindi       - punjabi     0.0353
+    [min=0.0148 max=0.0353 spread(max-min)=0.0205]
+
+  -- within Dravidian (4 languages) --
+    tamil       - telugu      0.0144
+    tamil       - malayalam   0.0150
+    telugu      - malayalam   0.0155
+    telugu      - kannada     0.0156
+    malayalam   - kannada     0.0161
+    tamil       - kannada     0.0195
+    [min=0.0144 max=0.0195 spread(max-min)=0.0050]
+
+  -- cross-family (Indo-Aryan <-> Dravidian) --
+    lowest 3: gujarati-telugu=0.0184, bengali-telugu=0.0205, gujarati-kannada=0.0239
+    highest 3: urdu-malayalam=0.0594, hindi-kannada=0.0615, hindi-malayalam=0.0669
+    [min=0.0184 max=0.0669 mean=0.0386]
+
+==============================================================================
+qwen_moe: full pairwise JSD, Indic languages only, grouped by family
+==============================================================================
+
+  -- within Indo-Aryan (6 languages) --
+    hindi       - bengali     0.0161
+    hindi       - marathi     0.0168
+    marathi     - bengali     0.0228
+    bengali     - gujarati    0.0339
+    gujarati    - punjabi     0.0389
+    hindi       - gujarati    0.0393
+    marathi     - gujarati    0.0430
+    bengali     - punjabi     0.0467
+    hindi       - urdu        0.0484
+    marathi     - punjabi     0.0492
+    hindi       - punjabi     0.0501
+    marathi     - urdu        0.0525
+    bengali     - urdu        0.0624
+    punjabi     - urdu        0.0874
+    gujarati    - urdu        0.0923
+    [min=0.0161 max=0.0923 spread(max-min)=0.0762]
+
+  -- within Dravidian (4 languages) --
+    tamil       - malayalam   0.0335
+    telugu      - kannada     0.0365
+    telugu      - malayalam   0.0433
+    tamil       - kannada     0.0436
+    malayalam   - kannada     0.0449
+    tamil       - telugu      0.0453
+    [min=0.0335 max=0.0453 spread(max-min)=0.0119]
+
+  -- cross-family (Indo-Aryan <-> Dravidian) --
+    lowest 3: bengali-tamil=0.0317, bengali-malayalam=0.0350, gujarati-malayalam=0.0364
+    highest 3: urdu-malayalam=0.0964, urdu-telugu=0.0969, urdu-kannada=0.0987
+    [min=0.0317 max=0.0987 mean=0.0540]
+
+==============================================================================
+deepseek_moe: full pairwise JSD, Indic languages only, grouped by family
+==============================================================================
+
+  -- within Indo-Aryan (6 languages) --
+    hindi       - marathi     0.0250
+    bengali     - gujarati    0.0287
+    hindi       - bengali     0.0299
+    marathi     - urdu        0.0357
+    hindi       - urdu        0.0367
+    hindi       - gujarati    0.0393
+    gujarati    - punjabi     0.0406
+    marathi     - bengali     0.0432
+    bengali     - punjabi     0.0517
+    bengali     - urdu        0.0556
+    marathi     - gujarati    0.0586
+    hindi       - punjabi     0.0636
+    gujarati    - urdu        0.0693
+    marathi     - punjabi     0.0842
+    punjabi     - urdu        0.0921
+    [min=0.0250 max=0.0921 spread(max-min)=0.0671]
+
+  -- within Dravidian (4 languages) --
+    telugu      - kannada     0.0153
+    telugu      - malayalam   0.0197
+    malayalam   - kannada     0.0206
+    tamil       - telugu      0.0279
+    tamil       - kannada     0.0313
+    tamil       - malayalam   0.0321
+    [min=0.0153 max=0.0321 spread(max-min)=0.0168]
+
+  -- cross-family (Indo-Aryan <-> Dravidian) --
+    lowest 3: gujarati-telugu=0.0238, bengali-tamil=0.0246, gujarati-kannada=0.0252
+    highest 3: marathi-malayalam=0.0758, urdu-kannada=0.0764, urdu-malayalam=0.0851
+    [min=0.0238 max=0.0851 mean=0.0511]

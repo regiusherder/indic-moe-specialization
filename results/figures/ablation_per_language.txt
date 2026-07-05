@@ -1,0 +1,83 @@
+==============================================================================
+olmoe: per-language ablation delta (targeted vs random-control baseline)
+==============================================================================
+
+  ablating Indo-Aryan-preferring experts, per language:
+    hindi       Indo-Aryan    (own family)     delta=1.2977 (random baseline for this lang=0.2761) ABOVE random
+    marathi     Indo-Aryan    (own family)     delta=1.3842 (random baseline for this lang=0.3535) ABOVE random
+    bengali     Indo-Aryan    (own family)     delta=0.8948 (random baseline for this lang=0.3272) ABOVE random
+    gujarati    Indo-Aryan    (own family)     delta=0.8484 (random baseline for this lang=0.2759) ABOVE random
+    punjabi     Indo-Aryan    (own family)     delta=0.9627 (random baseline for this lang=0.2701) ABOVE random
+    urdu        Indo-Aryan    (own family)     delta=1.4523 (random baseline for this lang=0.3325) ABOVE random
+    tamil       Dravidian     (other family)   delta=0.7464 (random baseline for this lang=0.2843) ABOVE random
+    telugu      Dravidian     (other family)   delta=0.9858 (random baseline for this lang=0.3258) ABOVE random
+    malayalam   Dravidian     (other family)   delta=0.8577 (random baseline for this lang=0.2999) ABOVE random
+    kannada     Dravidian     (other family)   delta=0.7677 (random baseline for this lang=0.2879) ABOVE random
+
+  ablating Dravidian-preferring experts, per language:
+    hindi       Indo-Aryan    (other family)   delta=0.3997 (random baseline for this lang=0.2761) ABOVE random
+    marathi     Indo-Aryan    (other family)   delta=0.4547 (random baseline for this lang=0.3535) ABOVE random
+    bengali     Indo-Aryan    (other family)   delta=0.4542 (random baseline for this lang=0.3272) ABOVE random
+    gujarati    Indo-Aryan    (other family)   delta=0.3384 (random baseline for this lang=0.2759) ABOVE random
+    punjabi     Indo-Aryan    (other family)   delta=0.3564 (random baseline for this lang=0.2701) ABOVE random
+    urdu        Indo-Aryan    (other family)   delta=0.3791 (random baseline for this lang=0.3325) ABOVE random
+    tamil       Dravidian     (own family)     delta=0.3821 (random baseline for this lang=0.2843) ABOVE random
+    telugu      Dravidian     (own family)     delta=0.4447 (random baseline for this lang=0.3258) ABOVE random
+    malayalam   Dravidian     (own family)     delta=0.5077 (random baseline for this lang=0.2999) ABOVE random
+    kannada     Dravidian     (own family)     delta=0.3830 (random baseline for this lang=0.2879) ABOVE random
+
+==============================================================================
+qwen_moe: per-language ablation delta (targeted vs random-control baseline)
+==============================================================================
+
+  ablating Indo-Aryan-preferring experts, per language:
+    hindi       Indo-Aryan    (own family)     delta=0.5313 (random baseline for this lang=0.2892) ABOVE random
+    marathi     Indo-Aryan    (own family)     delta=0.5230 (random baseline for this lang=0.3291) ABOVE random
+    bengali     Indo-Aryan    (own family)     delta=0.3729 (random baseline for this lang=0.3414) ABOVE random
+    gujarati    Indo-Aryan    (own family)     delta=0.2381 (random baseline for this lang=0.2521) at/below random
+    punjabi     Indo-Aryan    (own family)     delta=0.2788 (random baseline for this lang=0.2537) ABOVE random
+    urdu        Indo-Aryan    (own family)     delta=0.7361 (random baseline for this lang=0.3866) ABOVE random
+    tamil       Dravidian     (other family)   delta=0.2175 (random baseline for this lang=0.2838) at/below random
+    telugu      Dravidian     (other family)   delta=0.2142 (random baseline for this lang=0.3263) at/below random
+    malayalam   Dravidian     (other family)   delta=0.2085 (random baseline for this lang=0.3288) at/below random
+    kannada     Dravidian     (other family)   delta=0.1910 (random baseline for this lang=0.3640) at/below random
+
+  ablating Dravidian-preferring experts, per language:
+    hindi       Indo-Aryan    (other family)   delta=0.2611 (random baseline for this lang=0.2892) at/below random
+    marathi     Indo-Aryan    (other family)   delta=0.3148 (random baseline for this lang=0.3291) at/below random
+    bengali     Indo-Aryan    (other family)   delta=0.3296 (random baseline for this lang=0.3414) at/below random
+    gujarati    Indo-Aryan    (other family)   delta=0.4242 (random baseline for this lang=0.2521) ABOVE random
+    punjabi     Indo-Aryan    (other family)   delta=0.4955 (random baseline for this lang=0.2537) ABOVE random
+    urdu        Indo-Aryan    (other family)   delta=0.2211 (random baseline for this lang=0.3866) at/below random
+    tamil       Dravidian     (own family)     delta=0.6500 (random baseline for this lang=0.2838) ABOVE random
+    telugu      Dravidian     (own family)     delta=0.5886 (random baseline for this lang=0.3263) ABOVE random
+    malayalam   Dravidian     (own family)     delta=1.0679 (random baseline for this lang=0.3288) ABOVE random
+    kannada     Dravidian     (own family)     delta=0.4517 (random baseline for this lang=0.3640) ABOVE random
+
+==============================================================================
+deepseek_moe: per-language ablation delta (targeted vs random-control baseline)
+==============================================================================
+
+  ablating Indo-Aryan-preferring experts, per language:
+    hindi       Indo-Aryan    (own family)     delta=1.8708 (random baseline for this lang=1.1043) ABOVE random
+    marathi     Indo-Aryan    (own family)     delta=2.1234 (random baseline for this lang=1.2884) ABOVE random
+    bengali     Indo-Aryan    (own family)     delta=1.4684 (random baseline for this lang=1.1069) ABOVE random
+    gujarati    Indo-Aryan    (own family)     delta=1.7187 (random baseline for this lang=1.6556) ABOVE random
+    punjabi     Indo-Aryan    (own family)     delta=1.2483 (random baseline for this lang=1.3780) at/below random
+    urdu        Indo-Aryan    (own family)     delta=2.5995 (random baseline for this lang=1.3919) ABOVE random
+    tamil       Dravidian     (other family)   delta=1.4442 (random baseline for this lang=1.1116) ABOVE random
+    telugu      Dravidian     (other family)   delta=1.3869 (random baseline for this lang=1.4249) at/below random
+    malayalam   Dravidian     (other family)   delta=1.4574 (random baseline for this lang=1.4381) ABOVE random
+    kannada     Dravidian     (other family)   delta=1.6324 (random baseline for this lang=1.5196) ABOVE random
+
+  ablating Dravidian-preferring experts, per language:
+    hindi       Indo-Aryan    (other family)   delta=0.5484 (random baseline for this lang=1.1043) at/below random
+    marathi     Indo-Aryan    (other family)   delta=0.5828 (random baseline for this lang=1.2884) at/below random
+    bengali     Indo-Aryan    (other family)   delta=0.4736 (random baseline for this lang=1.1069) at/below random
+    gujarati    Indo-Aryan    (other family)   delta=0.8691 (random baseline for this lang=1.6556) at/below random
+    punjabi     Indo-Aryan    (other family)   delta=0.4956 (random baseline for this lang=1.3780) at/below random
+    urdu        Indo-Aryan    (other family)   delta=0.7412 (random baseline for this lang=1.3919) at/below random
+    tamil       Dravidian     (own family)     delta=0.6092 (random baseline for this lang=1.1116) at/below random
+    telugu      Dravidian     (own family)     delta=0.9611 (random baseline for this lang=1.4249) at/below random
+    malayalam   Dravidian     (own family)     delta=0.9649 (random baseline for this lang=1.4381) at/below random
+    kannada     Dravidian     (own family)     delta=0.8746 (random baseline for this lang=1.5196) at/below random
