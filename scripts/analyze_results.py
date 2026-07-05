@@ -226,11 +226,21 @@ def ablation_analysis(results: Path, summary: list, out: Path):
                 sub = targeted[(targeted["group"] == group) & (targeted["family"] == fam)]
                 deltas.append(sub["delta_vs_baseline"].mean() if len(sub) else 0.0)
             ax.bar(xpos + gi * width, deltas, width, label=f"ablate {group} experts")
-            # summary line: does ablating this group's experts hit its own family hardest?
+            # Test A: does ablating this group's experts hit its own family
+            # harder than RANDOM experts of the same count?
             own = targeted[(targeted["group"] == group) & (targeted["family"] == group)]["delta_vs_baseline"].mean()
             summary.append(f"  ablating {group}-preferring experts -> mean delta on {group} langs: "
                            f"{own:.4f} (random baseline {rand:.4f}; "
-                           f"{'SPECIFIC' if own > rand else 'not above random'})")
+                           f"{'SPECIFIC vs random' if own > rand else 'NOT above random'})")
+            # Test B (stronger): does it hit its own family harder than the OTHER
+            # Indic family? Only meaningful for the two Indic families.
+            if group in ("Indo-Aryan", "Dravidian"):
+                other_fam = "Dravidian" if group == "Indo-Aryan" else "Indo-Aryan"
+                on_other = targeted[(targeted["group"] == group) & (targeted["family"] == other_fam)]["delta_vs_baseline"].mean()
+                diff = own - on_other
+                summary.append(f"      vs other family ({other_fam}): {on_other:.4f}  "
+                               f"differential={diff:+.4f} "
+                               f"({'family-specific' if diff > 0 else 'NOT family-specific'})")
         ax.set_xticks(xpos + width * (len(groups)-1) / 2)
         ax.set_xticklabels(fams)
         ax.axhline(rand, ls="--", color="k", lw=1, label="random-control mean")

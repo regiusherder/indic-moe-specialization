@@ -34,20 +34,30 @@ Measured across **OLMoE-1B-7B** (64 experts, no shared, English-heavy training),
 2. **The Hindi–Urdu control splits by architecture.** Hindi and Urdu are
    nearly the same spoken language written in different scripts (Devanagari vs
    Perso-Arabic), so they cleanly separate *language identity* from *script*.
-   The English-heavy **OLMoE** routes them together (language identity wins,
-   ratio 0.56); the multilingual **Qwen** routes them apart (script dominates,
-   ratio 1.58); **DeepSeek** is intermediate. Counterintuitively, the model with
-   *less* multilingual training shows *more* language-identity routing — which
-   confirms Mixtral's syntactic-routing claim for the multilingual models but
-   breaks it for the English-heavy one.
+   The English-heavy **OLMoE** routes them together (Hindi–Urdu JSD *below*
+   Hindi's mean to its other Indo-Aryan relatives, ratio 0.56 — language
+   identity wins); the multilingual **Qwen** routes them apart (ratio 1.58 —
+   script wins); **DeepSeek** sits in between (ratio 0.93, roughly tied). So on
+   this control the three models disagree, and the ordering runs *opposite* to
+   the naive expectation: the model with the least multilingual training shows
+   the strongest language-identity (script-invariant) routing. This is
+   consistent with Mixtral's "routing is syntactic/script-like" claim for Qwen,
+   ambiguous for DeepSeek, and contrary to it for OLMoE — i.e. the claim is
+   architecture-dependent, not universal, on Indic text.
 
-3. **Specialization deepens with layer depth**, with a distinct signature per
-   architecture (clean and monotonic in OLMoE; volatile with a late-layer jump
-   in Qwen; reversed family ordering in DeepSeek).
+3. **Specialization broadly increases with layer depth**, with a distinct
+   signature per architecture. In OLMoE the Dravidian/Indo-Aryan ordering is
+   consistent at every layer (Dravidian diverges more from English throughout)
+   and overall divergence rises toward the final layers; Qwen is noisier with a
+   sharp late-layer jump; DeepSeek shows the reversed family ordering.
 
-4. **Ablation gives causal backing.** Ablating a family's most-preferred experts
-   hurts that family's languages more than ablating the same number of *random*
-   experts, in 5 of 6 Indic cases — evidence that these experts causally carry
+4. **Ablation gives causal backing.** Two specificity tests, both supportive:
+   ablating a family's most-preferred experts hurts that family's languages
+   more than ablating the same number of *random* experts in 5 of 6 Indic cases
+   (the exception is DeepSeek's Dravidian experts, whose random baseline is
+   unusually high); and on the stronger cross-family test — does ablating family
+   F hurt F more than the *other* family? — the differential is positive in
+   **all 6 cases**. Together this is evidence that these experts causally carry
    these languages, not merely correlate with them.
 
 ### The numbers
