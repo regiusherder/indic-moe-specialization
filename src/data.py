@@ -1,11 +1,24 @@
-"""FLORES-200 acquisition and token-capped sampling.
+"""FLORES-200 acquisition and two sampling conditions.
 
-Sampling is capped by TOKEN COUNT per language, not sentence count or char
-count. This is deliberate: tokenization fertility varies up to 9x across
-scripts in this study (English ~0.20 tok/char vs Punjabi ~1.78 tok/char).
-Capping by sentence count would give high-fertility languages far more
-routing decisions (= more statistical power) than low-fertility ones purely
-as an artifact of orthography, contaminating any cross-language JSD comparison.
+The study runs each model under TWO sampling schemes, because they control
+complementary confounds and no single scheme controls both:
+
+  token_capped -- equal TOKEN COUNT per language (~20k). Tokenization fertility
+    varies up to ~9x across scripts (English ~0.20 tok/char vs Punjabi ~1.78),
+    so capping by SENTENCE count would give high-fertility languages far more
+    routing decisions (= more statistical power) than low-fertility ones purely
+    as an artifact of orthography. Capping by tokens equalizes statistical
+    precision. COST: each language then covers different CONTENT -- English
+    spans ~736 FLORES sentences to reach the budget, Malayalam ~73 -- so the
+    languages are compared on non-overlapping slices of the parallel corpus
+    (critique #5).
+
+  aligned -- the SAME aligned sentence indices for every language. FLORES-200
+    is sentence-aligned (line i is the same meaning in every language), so this
+    controls content perfectly: every language routes on identical material
+    (critique #6). COST: token counts then differ by fertility, reintroducing
+    the precision imbalance token_capped removed -- which is exactly why we run
+    both and require the family-structure finding to survive under each.
 """
 import hashlib
 import os
@@ -82,35 +95,49 @@ def build_token_capped_sample(
     sentences: list[str],
     tokenizer,
     max_tokens: int,
-) -> tuple[str, int, int]:
-    """Concatenate sentences one at a time until the token budget is hit.
+) -> tuple[list[str], int]:
+    """Take sentences in order until adding the next one would exceed the token
+    budget. Returns (selected_sentences, n_tokens_estimate).
 
-    Returns (text, n_sentences_used, n_tokens_actual). n_tokens_actual may be
-    slightly under max_tokens (stops before exceeding, doesn't truncate mid-sentence)
-    so token counts are comparable but not necessarily byte-identical across languages.
+    Returns the SENTENCE LIST (not a concatenated blob) so the pipeline can feed
+    them to the model one at a time -- routing is captured per-sentence, which
+    the bootstrap and permutation tests need. Token counting uses the same
+    per-sentence, no-special-token convention the extraction loop's counts are
+    compared against; the earlier version counted the growing *concatenated*
+    string, which double-counted separators and disagreed with what the model
+    was actually fed (critique #7 -- consistency between budgeting and extraction).
     """
-    text = ""
-    n_sentences = 0
+    selected = []
     n_tokens = 0
     for sentence in sentences:
-        candidate = (text + " " + sentence).strip() if text else sentence
-        # This call only counts tokens toward the budget below — it never
-        # feeds `candidate` through the model — but the growing string can
-        # legitimately exceed a model's max_position_embeddings mid-loop
-        # (observed: DeepSeek's tokenizer warns at 16396 > 16384) before this
-        # function's own max_tokens cap (e.g. 20000) is reached. verbose=False
-        # silences that harmless warning; truncation is irrelevant here since
-        # we only read len(input_ids), never decode/forward this tensor.
-        candidate_tokens = len(tokenizer(candidate, add_special_tokens=False, verbose=False)["input_ids"])
-        if candidate_tokens > max_tokens and n_sentences > 0:
+        # count this sentence on its own (matches how it will actually be fed:
+        # each sentence is a separate forward pass, not concatenated)
+        st = len(tokenizer(sentence, add_special_tokens=False, verbose=False)["input_ids"])
+        if n_tokens + st > max_tokens and selected:
             break
-        text = candidate
-        n_tokens = candidate_tokens
-        n_sentences += 1
+        selected.append(sentence)
+        n_tokens += st
         if n_tokens >= max_tokens:
             break
 
-    if n_sentences == 0:
+    if not selected:
         raise RuntimeError("Token budget too small to fit even one sentence — increase max_tokens_per_language.")
 
-    return text, n_sentences, n_tokens
+    return selected, n_tokens
+
+
+def build_aligned_sample(
+    sentences: list[str],
+    n_aligned_sentences: int,
+) -> tuple[list[str], int]:
+    """The first n_aligned_sentences sentences, verbatim, no tokenizer involved.
+
+    Because FLORES-200 is line-aligned, taking the first N lines gives the SAME
+    content (same source sentences) for every language -- the whole point of the
+    aligned condition. No token budget: token counts will vary by fertility, and
+    that's the honest cost we report. Returns (selected_sentences, n_selected).
+    """
+    selected = sentences[:n_aligned_sentences]
+    if not selected:
+        raise RuntimeError("No sentences available for aligned sampling.")
+    return selected, len(selected)

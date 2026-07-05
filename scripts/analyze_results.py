@@ -310,6 +310,23 @@ def main():
     if not (results / "olmoe").exists() and (results / "results" / "olmoe").exists():
         results = results / "results"
 
+    # Detect the NEW multi-condition/multi-seed layout
+    # (results/<condition>/seed<N>/<model>/...) and refuse rather than
+    # silently misread it. These analysis scripts still expect the OLD
+    # single-condition layout (results/<model>/...); they are being reworked
+    # for the new layout AFTER the multi-condition pod run. To analyze new
+    # results, point --results at one specific cell, e.g.
+    # ./results-from-runpod/token_capped/seed42
+    if (results / "token_capped").exists() or (results / "aligned").exists():
+        raise SystemExit(
+            "This looks like the NEW multi-condition layout "
+            "(results/<condition>/seed<N>/<model>/).\n"
+            "These analysis scripts currently expect the OLD single-condition "
+            "layout (results/<model>/) and are being reworked for the new one.\n"
+            "For now, point --results at ONE cell, e.g.:\n"
+            f"  --results {results}/token_capped/seed42\n"
+        )
+
     missing = [m for m in MODELS if not (results / m / "03_analysis" / "jsd_by_layer.json").exists()]
     if missing:
         raise SystemExit(f"Missing analysis outputs for: {missing}\n"

@@ -3,7 +3,12 @@
 # changing exactly one line here, and the run manifest hashes this file
 # so every result is traceable to the config that produced it.
 
-seed: 42
+# Seeds: the full run matrix is (models) x (sampling conditions) x (seeds).
+# Two seeds let us measure how much the small ablation/permutation differentials
+# move run-to-run (critique #22). Seed 0 controls sampling-independent randomness
+# (permutation shuffles, bootstrap, random-expert ablation); the aligned/token
+# sampling itself is deterministic so seeds only affect the stochastic analyses.
+seeds: [42, 1234]
 
 models:
   olmoe:
@@ -17,49 +22,62 @@ models:
     adapter: "qwen_moe"
     quantization: "4bit"
   deepseek_moe:
-    # deepseek-moe-16b-base, NOT DeepSeek-V2-Lite. Swapped 2026-07-03 after
-    # V2-Lite's shard 3/4 download failed reproducibly (xet backend errors +
-    # a disk-quota error, on 3 separate pod attempts) — this is the ORIGINAL
-    # DeepSeekMoE paper's model, same architecture family (64 routed experts,
-    # 2 shared experts, top-6, dense layer 0, custom modeling_deepseek.py
-    # with an identical MoEGate returning (topk_idx, topk_weight, aux_loss)),
-    # so src/adapters/deepseek_moe.py's hook logic applies to both models —
-    # only this hf_id needed to change when V2-Lite's download kept failing.
     hf_id: "deepseek-ai/deepseek-moe-16b-base"
     revision: null
     adapter: "deepseek_moe"
     quantization: "4bit"
 
-# FLORES-200 language codes with linguistic metadata used for grouping/plots.
-# Urdu is the critical script-vs-family control (near-identical to Hindi, different script).
+# FLORES-200 language codes with linguistic metadata.
+# `pair_id`: languages sharing a pair_id are the SAME language in DIFFERENT
+# scripts -- the clean script-vs-language controls (critique #25). We now have
+# TWO such pairs, not one: Hindi/Urdu and Kashmiri-Deva/Kashmiri-Arab.
 languages:
-  english:   {code: eng_Latn, family: Indo-European, script: Latin}
-  hindi:     {code: hin_Deva, family: Indo-Aryan,     script: Devanagari}
-  marathi:   {code: mar_Deva, family: Indo-Aryan,     script: Devanagari}
-  bengali:   {code: ben_Beng, family: Indo-Aryan,     script: Bengali}
-  gujarati:  {code: guj_Gujr, family: Indo-Aryan,     script: Gujarati}
-  punjabi:   {code: pan_Guru, family: Indo-Aryan,     script: Gurmukhi}
-  urdu:      {code: urd_Arab, family: Indo-Aryan,     script: Perso-Arabic}
-  tamil:     {code: tam_Taml, family: Dravidian,      script: Tamil}
-  telugu:    {code: tel_Telu, family: Dravidian,      script: Telugu}
-  malayalam: {code: mal_Mlym, family: Dravidian,      script: Malayalam}
-  kannada:   {code: kan_Knda, family: Dravidian,      script: Kannada}
+  english:      {code: eng_Latn, family: Indo-European, script: Latin,        pair_id: null}
+  # --- Indo-Aryan, Devanagari ---
+  hindi:        {code: hin_Deva, family: Indo-Aryan,     script: Devanagari,   pair_id: hindustani}
+  marathi:      {code: mar_Deva, family: Indo-Aryan,     script: Devanagari,   pair_id: null}
+  nepali:       {code: npi_Deva, family: Indo-Aryan,     script: Devanagari,   pair_id: null}
+  kashmiri_deva: {code: kas_Deva, family: Indo-Aryan,    script: Devanagari,   pair_id: kashmiri}
+  # --- Indo-Aryan, other scripts ---
+  bengali:      {code: ben_Beng, family: Indo-Aryan,     script: Bengali,      pair_id: null}
+  assamese:     {code: asm_Beng, family: Indo-Aryan,     script: Bengali,      pair_id: null}
+  gujarati:     {code: guj_Gujr, family: Indo-Aryan,     script: Gujarati,     pair_id: null}
+  punjabi:      {code: pan_Guru, family: Indo-Aryan,     script: Gurmukhi,     pair_id: null}
+  odia:         {code: ory_Orya, family: Indo-Aryan,     script: Odia,         pair_id: null}
+  urdu:         {code: urd_Arab, family: Indo-Aryan,     script: Perso-Arabic, pair_id: hindustani}
+  sindhi:       {code: snd_Arab, family: Indo-Aryan,     script: Perso-Arabic, pair_id: null}
+  kashmiri_arab: {code: kas_Arab, family: Indo-Aryan,    script: Perso-Arabic, pair_id: kashmiri}
+  # --- Dravidian (FLORES has exactly these four) ---
+  tamil:        {code: tam_Taml, family: Dravidian,      script: Tamil,        pair_id: null}
+  telugu:       {code: tel_Telu, family: Dravidian,      script: Telugu,       pair_id: null}
+  malayalam:    {code: mal_Mlym, family: Dravidian,      script: Malayalam,    pair_id: null}
+  kannada:      {code: kan_Knda, family: Dravidian,      script: Kannada,      pair_id: null}
 
 data:
   flores_url: "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz"
   flores_sha256: null   # filled in automatically on first download and verified on every subsequent run
   split: "devtest"
-  # Sampling is capped by TOKEN count, not sentence count or character count.
-  # This closes the fertility confound: every language contributes the same
-  # number of routing decisions, regardless of how many tokens its script needs
-  # to represent the same content.
-  max_tokens_per_language: 20000
-  max_sentences_pool: 1012   # full FLORES-200 devtest size; sampling stops early once max_tokens_per_language is hit
+
+  # TWO sampling conditions, run for every model. Family structure that shows
+  # up under BOTH answers critiques #5 (content confound) and #6 (parallel
+  # corpus) together -- neither confound can then explain it.
+  sampling_conditions:
+    # (a) equal TOKENS per language (original scheme): equal statistical
+    #     precision, but each language covers different CONTENT (English spans
+    #     ~736 FLORES sentences to reach the budget, Malayalam ~73).
+    token_capped:
+      max_tokens_per_language: 20000
+      max_sentences_pool: 1012
+    # (b) same ALIGNED sentences for every language: identical content across
+    #     languages (FLORES is sentence-aligned), but token counts then differ
+    #     by fertility. n_sentences = the full devtest set.
+    aligned:
+      n_aligned_sentences: 1012   # full FLORES-200 devtest; identical indices for all languages
 
 routing:
-  # JSD is computed per-layer (not just one "representative" layer) using the
-  # full softmax routing distribution over routed experts (shared experts,
-  # where present, are excluded — see adapters/).
+  # JSD is computed per-layer using routed experts only (shared experts, where
+  # present, are excluded -- see adapters/). Both hard (top-k counts) and soft
+  # (mean softmax) metrics are computed and compared.
   permutation_test:
     n_permutations: 1000
     alpha: 0.001
@@ -67,10 +85,24 @@ routing:
     n_resamples: 200      # sentence-level bootstrap for CIs on JSD estimates
 
 ablation:
-  top_n_experts: 8
-  n_random_controls: 10   # number of random-expert-ablation runs per language-group, for the causal control
+  # top_n_experts is now a SWEEP (critique #17): report the causal effect at
+  # several ablation sizes so the conclusion doesn't hinge on one unmotivated k.
+  top_n_experts_sweep: [4, 8, 16]
+  n_random_controls: 10   # random-expert-ablation trials, for the causal control
   perplexity_max_tokens: 2000
+  # min_usage_floor (critique #16): when picking "family-preferring" experts by
+  # target/other usage RATIO, ignore experts whose overall usage is below this
+  # fraction of uniform (1/n_experts). Without a floor the +1e-8 smoothing lets
+  # near-zero-traffic experts dominate the ratio and get ablated for no effect.
+  min_usage_floor_frac: 0.5
+  # knockout mechanism (critique #18): "renorm" = old behavior (zero the
+  # ablated experts' routing weight and renormalize survivors, which upweights
+  # neighbors); "drop" = remove from top-k WITHOUT renormalizing (isolates the
+  # ablated expert's own contribution). "drop" is the cleaner causal test.
+  knockout: "drop"
 
 output:
   results_dir: "results"
-  checkpoint_after_each: true   # write intermediate artifacts after every language/model so a crash loses at most one unit of work
+  # results are written to results/<sampling_condition>/<seed>/<model>/... so the
+  # full matrix never collides. checkpoint_after_each keeps per-language resume.
+  checkpoint_after_each: true

@@ -42,10 +42,17 @@ class MoEAdapter(ABC):
         implementations should clear internal state on each fresh forward."""
         ...
 
+    #: knockout mode for ablation, set by the pipeline from config:
+    #:   "drop"   -- remove ablated experts from the mix WITHOUT renormalizing
+    #:              survivors (isolates the ablated experts' own contribution)
+    #:   "renorm" -- zero their weight and renormalize survivors (upweights
+    #:              neighbors; conflates removal with redistribution)
+    knockout: str = "drop"
+
     @abstractmethod
     def ablate_experts(self, experts_by_layer: dict[int, list[int]]):
-        """Context manager: zero out (and renormalize) routing weight for the given
-        routed-expert indices, per layer, for the duration of the `with` block."""
+        """Context manager: suppress the given routed-expert indices per layer
+        for the duration of the `with` block, using self.knockout mode."""
         ...
 
     def clear_captures(self):

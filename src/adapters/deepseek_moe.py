@@ -116,13 +116,14 @@ class DeepSeekMoEAdapter(MoEAdapter):
         return self._captures
 
     def ablate_experts(self, experts_by_layer: dict[int, list[int]]):
-        return _DeepSeekAblator(self.model, experts_by_layer)
+        return _DeepSeekAblator(self.model, experts_by_layer, self.knockout)
 
 
 class _DeepSeekAblator:
-    def __init__(self, model, experts_by_layer):
+    def __init__(self, model, experts_by_layer, knockout="drop"):
         self.model = model
         self.experts_by_layer = experts_by_layer
+        self.knockout = knockout
         self.hooks = []
 
     def __enter__(self):
@@ -130,7 +131,7 @@ class _DeepSeekAblator:
             if layer_idx not in self.experts_by_layer or not hasattr(layer.mlp, "gate"):
                 continue
             to_zero = self.experts_by_layer[layer_idx]
-            self.hooks.append(layer.mlp.gate.register_forward_hook(self._make_ablation_hook(to_zero)))
+            self.hooks.append(layer.mlp.gate.register_forward_hook(self._make_ablation_hook(to_zero, self.knockout)))
         return self
 
     def __exit__(self, *args):
@@ -139,16 +140,21 @@ class _DeepSeekAblator:
         self.hooks = []
 
     @staticmethod
-    def _make_ablation_hook(experts_to_zero):
+    def _make_ablation_hook(experts_to_zero, knockout):
         def hook(module, inputs, output):
+            # gate returns (topk_idx, topk_weight, aux_loss). Zero the ablated
+            # experts' selection weights; then either renormalize survivors
+            # ("renorm") or leave them ("drop" -- removes the ablated experts'
+            # contribution without upweighting neighbors, critique #18).
             topk_idx, topk_weight, aux_loss = output
             mask = torch.zeros_like(topk_idx, dtype=torch.bool)
             for expert_id in experts_to_zero:
                 mask = mask | (topk_idx == expert_id)
             topk_weight = topk_weight.clone()
             topk_weight[mask] = 0.0
-            row_sum = topk_weight.sum(dim=-1, keepdim=True)
-            row_sum = torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum))
-            topk_weight = topk_weight / row_sum
+            if knockout == "renorm":
+                row_sum = topk_weight.sum(dim=-1, keepdim=True)
+                row_sum = torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum))
+                topk_weight = topk_weight / row_sum
             return (topk_idx, topk_weight, aux_loss)
         return hook

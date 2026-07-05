@@ -94,17 +94,34 @@ class QwenMoEAdapter(MoEAdapter):
         return self._captures
 
     def ablate_experts(self, experts_by_layer: dict[int, list[int]]):
-        return _QwenAblator(self.model, experts_by_layer, self.top_k)
+        return _QwenAblator(self.model, experts_by_layer, self.top_k, self.knockout)
 
 
 class _QwenAblator:
     """Ablates routed experts only; shared experts are never touched (by design —
-    they are excluded from the specialization hypothesis being tested)."""
+    they are excluded from the specialization hypothesis being tested).
 
-    def __init__(self, model, experts_by_layer, top_k):
+    KNOCKOUT LIMITATION (critique #18): Qwen's ablation works by forcing the
+    ablated experts' router LOGITS to -inf, after which the downstream
+    Qwen2MoeSparseMoeBlock re-runs softmax + top-k over the survivors. That
+    downstream re-softmax is inherently a RENORM over the remaining experts.
+    A clean "drop" (removing an expert's contribution without upweighting
+    neighbors) is not expressible at the logits level, because we don't have
+    access to the post-softmax weights before dispatch here. So this adapter
+    always behaves as knockout=="renorm" regardless of the requested mode; it
+    warns once if "drop" was requested so the discrepancy is on the record
+    rather than silent. (OLMoE and DeepSeek can honor "drop"; Qwen can't.)
+    """
+
+    def __init__(self, model, experts_by_layer, top_k, knockout="drop"):
         self.model = model
         self.experts_by_layer = experts_by_layer
         self.top_k = top_k
+        self.knockout = knockout
+        if knockout == "drop" and not getattr(_QwenAblator, "_warned_drop", False):
+            print("[qwen_moe] NOTE: knockout='drop' requested but Qwen's logit-level "
+                  "ablation can only renormalize; treating as 'renorm'. Recorded in manifest.")
+            _QwenAblator._warned_drop = True
         self.hooks = []
 
     def __enter__(self):
@@ -122,11 +139,8 @@ class _QwenAblator:
 
     def _make_ablation_hook(self, experts_to_zero):
         def hook(module, inputs, output):
-            # Rewrite the raw router logits so ablated experts get -inf,
-            # forcing top-k selection to skip them. This changes what the
-            # *rest* of the block (which recomputes softmax/topk from these
-            # logits downstream) actually dispatches to — verify this matches
-            # the live Qwen2MoeSparseMoeBlock.forward control flow before trusting results.
+            # Force ablated experts' logits to -inf; downstream top-k skips them
+            # and re-softmaxes over survivors (an inherent renorm; see class doc).
             logits = output.clone()
             logits[:, experts_to_zero] = float("-inf")
             return logits

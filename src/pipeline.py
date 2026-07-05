@@ -1,12 +1,20 @@
-"""Orchestrates one model end-to-end: load -> sample data -> extract routing
--> JSD/permutation/bootstrap -> ablation (targeted + random control) -> save.
+"""Orchestrates one model across the full run matrix: for a given model, loop
+over (sampling condition) x (seed), and for each such CELL run:
+  sample data -> extract routing -> JSD/permutation/bootstrap -> ablation.
 
-Checkpointing contract: after EVERY language's routing extraction and after
-the full ablation study, an intermediate artifact is written to disk before
-moving on. If the process crashes or the pod is killed mid-run, re-running
-`run_model.py --model X` picks up from the last completed checkpoint instead
-of redoing finished work — this matters on rented spot/community-cloud GPUs
-that can be preempted.
+The model is loaded ONCE (the expensive step) and reused across all cells; only
+the data sampling and the stochastic analyses differ per cell. Results for each
+cell go to results/<condition>/<seed>/<model>/ so the matrix never collides.
+
+Checkpointing is per cell and per language: a crash re-runs only the unfinished
+cell, and within it only the unfinished languages.
+
+Sampling conditions (see src/data.py):
+  token_capped -- equal tokens/language (equal precision, different content)
+  aligned      -- same aligned FLORES sentences/language (same content,
+                  different token counts)
+Running both and requiring the finding to survive each answers the content-vs-
+precision confound pair (critiques #5, #6).
 """
 import json
 import pickle
@@ -14,11 +22,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
+# torch is imported lazily inside _extract_routing (the only place it's used)
+# so the pipeline can be imported and mock-tested without torch installed.
 
 from . import routing as routing_mod
-from .ablation import run_ablation_study, top_experts_for_group
-from .data import build_token_capped_sample, download_flores, load_language_sentences
+from .ablation import run_ablation_study
+from .data import (build_aligned_sample, build_token_capped_sample,
+                   download_flores, load_language_sentences)
 from .manifest import write_manifest
 
 
@@ -36,14 +46,10 @@ def _adapter_for(name: str):
 
 
 def _routing_checkpoint_is_valid(loaded, n_routed_experts: int) -> bool:
-    """A cached routing pickle is only reusable if it has soft-routing prob
-    sums AND every per-sentence prob vector is exactly (n_routed_experts,) —
-    i.e. shape-consistent so np.sum(..., axis=0) at stage 4 won't hit the
-    inhomogeneous-array error the DeepSeek hook bug produced (2026-07-04)."""
     prob_sums = getattr(loaded, "per_sentence_prob_sums", None)
     if not prob_sums:
         return False
-    for layer_idx, per_sentence in prob_sums.items():
+    for _, per_sentence in prob_sums.items():
         if not per_sentence:
             return False
         for vec in per_sentence:
@@ -52,124 +58,61 @@ def _routing_checkpoint_is_valid(loaded, n_routed_experts: int) -> bool:
     return True
 
 
-def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_root: Path):
-    model_cfg = config["models"][model_key]
-    out_dir = results_root / model_key
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _build_samples(config, adapter, flores_dir, condition_name, condition_cfg):
+    """Returns {lang: {"code","family","script","pair_id","sentences":[...],
+    "n_sentences","n_tokens_est"}} for one sampling condition."""
+    split = config["data"]["split"]
+    samples = {}
+    for lang_name, lang_meta in config["languages"].items():
+        if condition_name == "token_capped":
+            pool = load_language_sentences(flores_dir, lang_meta["code"], split,
+                                           condition_cfg["max_sentences_pool"])
+            sents, n_tok = build_token_capped_sample(pool, adapter.tokenizer,
+                                                     condition_cfg["max_tokens_per_language"])
+        elif condition_name == "aligned":
+            pool = load_language_sentences(flores_dir, lang_meta["code"], split,
+                                           condition_cfg["n_aligned_sentences"])
+            sents, _ = build_aligned_sample(pool, condition_cfg["n_aligned_sentences"])
+            n_tok = None  # varies by fertility; measured for real during extraction
+        else:
+            raise ValueError(f"Unknown sampling condition '{condition_name}'")
+        samples[lang_name] = {**lang_meta, "sentences": sents,
+                              "n_sentences": len(sents), "n_tokens_est": n_tok}
+        print(f"  {lang_name:<14s} [{condition_name}] {len(sents)} sentences"
+              + (f", ~{n_tok} tokens" if n_tok else " (aligned; tokens vary)"))
+    return samples
 
-    checkpoint_path = out_dir / "_checkpoint.json"
-    checkpoint = json.loads(checkpoint_path.read_text()) if checkpoint_path.exists() else {"stage": "start"}
 
-    print(f"\n{'='*70}\n{model_key}: starting from checkpoint stage '{checkpoint['stage']}'\n{'='*70}")
-
-    if checkpoint.get("stage") == "complete" and (out_dir / "04_ablation" / "ablation_results.csv").exists():
-        print(f"{model_key}: already complete (checkpoint says so and ablation_results.csv exists) — "
-              f"skipping entirely, no model load needed. Delete {checkpoint_path} to force a re-run.")
-        return out_dir
-
-    # ---- Stage 0: data ----
-    cache_dir = results_root / "_flores_cache"
-    flores_dir, flores_sha256 = download_flores(cache_dir, config["data"]["flores_url"], config["data"]["flores_sha256"])
-    write_manifest(out_dir, config, config_path, extra={"model_key": model_key, "flores_sha256": flores_sha256})
-
-    # ---- Stage 1: load model ----
-    adapter = _adapter_for(model_cfg["adapter"])
-    print(f"Loading {model_cfg['hf_id']} ...")
-    adapter.load(model_cfg["hf_id"], model_cfg.get("revision"), model_cfg["quantization"])
-    print(f"Loaded. layers={adapter.num_layers} routed_experts={adapter.num_routed_experts} "
-          f"top_k={adapter.top_k} shared_experts={adapter.n_shared_experts} "
-          f"resolved_revision={getattr(adapter, 'resolved_revision', 'n/a')}")
-
-    hooks = adapter.register_hooks()
-
-    # ---- Stage 2: build token-capped samples per language ----
-    samples_path = out_dir / "01_samples.json"
-    if samples_path.exists():
-        samples = json.loads(samples_path.read_text())
-        # Guard against config drift on resume: if the language set changed
-        # since samples were built, silently reusing them would produce a
-        # run whose manifest config doesn't match its actual data.
-        if set(samples.keys()) != set(config["languages"].keys()):
-            raise RuntimeError(
-                f"Resume mismatch: {samples_path} covers languages "
-                f"{sorted(samples.keys())} but config specifies "
-                f"{sorted(config['languages'].keys())}. The config changed after "
-                f"this run started. Delete {out_dir} to start fresh, or restore the config."
-            )
-    else:
-        samples = {}
-        for lang_name, lang_meta in config["languages"].items():
-            sentences = load_language_sentences(
-                flores_dir, lang_meta["code"], config["data"]["split"], config["data"]["max_sentences_pool"]
-            )
-            text, n_sent, n_tok = build_token_capped_sample(
-                sentences, adapter.tokenizer, config["data"]["max_tokens_per_language"]
-            )
-            samples[lang_name] = {"text": text, "n_sentences": n_sent, "n_tokens": n_tok, **lang_meta}
-            print(f"  {lang_name:<12s} sampled: {n_sent} sentences, {n_tok} tokens (budget {config['data']['max_tokens_per_language']})")
-        samples_path.write_text(json.dumps(samples, indent=2, ensure_ascii=False))
-    print(f"Saved intermediate artifact: {samples_path}")
-
-    # ---- Stage 3: routing extraction (per-sentence, checkpointed per language) ----
-    extraction_dir = out_dir / "02_routing_raw"
-    extraction_dir.mkdir(exist_ok=True)
-    records: dict[str, routing_mod.LanguageRoutingRecord] = {}
-
+def _extract_routing(adapter, samples, extraction_dir):
+    """Per-language, per-sentence routing extraction with per-language checkpoints."""
+    import torch
+    records = {}
     for lang_name, sample in samples.items():
         lang_ckpt = extraction_dir / f"{lang_name}.pkl"
         if lang_ckpt.exists():
             with open(lang_ckpt, "rb") as f:
                 loaded = pickle.load(f)
-            # A cached checkpoint is only trustworthy if (a) it has the
-            # soft-routing prob sums at all (old pre-soft-metric format lacks
-            # them) AND (b) those prob sums are shape-consistent per layer — a
-            # ragged set of per-sentence vectors crashes stage 4 inside
-            # soft_distribution with an inhomogeneous-array error. The DeepSeek
-            # hook bug (fixed 2026-07-04) produced exactly such ragged pickles;
-            # validating here means a `git pull` + re-run auto-discards the bad
-            # DeepSeek pickles and re-extracts them, without touching already-
-            # complete models (OLMoE/Qwen are skipped by the top-level guard
-            # before this code ever runs) and without manual pkl deletion.
             if _routing_checkpoint_is_valid(loaded, adapter.num_routed_experts):
                 records[lang_name] = loaded
-                print(f"  [resume] {lang_name}: routing already extracted, loaded from checkpoint")
                 continue
-            print(f"  [resume] {lang_name}: checkpoint is stale/invalid (missing or "
-                  f"ragged soft-routing data) — deleting and re-extracting")
             lang_ckpt.unlink(missing_ok=True)
 
-        print(f"  Extracting routing for {lang_name} ...")
-        per_sentence_selected = {}
-        per_sentence_prob_sums = {}
-        per_sentence_token_counts = []
-        # Re-load original FLORES sentences (not the concatenated blob from
-        # data.py) so routing is captured per-sentence — bootstrap resampling
-        # in routing.py needs sentence-level granularity, and concatenation
-        # only exists to build the token-capped sample for the fertility check.
-        sentences = load_language_sentences(
-            flores_dir, sample["code"], config["data"]["split"], config["data"]["max_sentences_pool"]
-        )[: sample["n_sentences"]]
-
+        print(f"    extracting routing for {lang_name} ...")
+        per_sentence_selected, per_sentence_prob_sums, per_sentence_token_counts = {}, {}, []
         n_tokens_actual = 0
-        for sentence in sentences:
+        for sentence in sample["sentences"]:
             adapter.clear_captures()
-            inputs = adapter.tokenizer(sentence, return_tensors="pt", truncation=True, max_length=512).to(adapter.model.device)
-            n_sentence_tokens = inputs["input_ids"].shape[1]
-            n_tokens_actual += n_sentence_tokens
-            per_sentence_token_counts.append(n_sentence_tokens)
+            inputs = adapter.tokenizer(sentence, return_tensors="pt", truncation=True,
+                                       max_length=512).to(adapter.model.device)
+            n_tok = inputs["input_ids"].shape[1]
+            n_tokens_actual += n_tok
+            per_sentence_token_counts.append(n_tok)
             with torch.no_grad():
                 _ = adapter.model(**inputs)
-            captures = adapter.get_captures()
-            for layer_idx, cap in captures.items():
+            for layer_idx, cap in adapter.get_captures().items():
                 per_sentence_selected.setdefault(layer_idx, []).append(cap.selected_experts.numpy())
-                # sum (not mean) over tokens — see LanguageRoutingRecord docstring
-                per_sentence_prob_sums.setdefault(layer_idx, []).append(
-                    cap.routing_probs.sum(dim=0).numpy()
-                )
+                per_sentence_prob_sums.setdefault(layer_idx, []).append(cap.routing_probs.sum(dim=0).numpy())
 
-        # n_tokens is the count actually forwarded per-sentence, which can
-        # differ slightly from the sample-building estimate (special tokens,
-        # concatenation boundaries) — record what really happened.
         record = routing_mod.LanguageRoutingRecord(
             language=lang_name, lang_code=sample["code"],
             n_sentences=sample["n_sentences"], n_tokens=n_tokens_actual,
@@ -180,142 +123,153 @@ def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_
         records[lang_name] = record
         with open(lang_ckpt, "wb") as f:
             pickle.dump(record, f)
-        print(f"    saved checkpoint: {lang_ckpt}")
+    return records
 
-    # Routing extraction is done — remove the capture hooks now. Leaving them
-    # attached through the analysis/ablation stages would copy router tensors
-    # to CPU on every one of the hundreds of ablation forward passes for
-    # nothing, and stack capture hooks on the same modules the ablation
-    # hooks target.
-    for h in hooks:
-        h.remove()
-    hooks = []
 
-    # ---- Stage 4: JSD matrices, permutation tests, bootstrap CIs — per layer ----
-    analysis_dir = out_dir / "03_analysis"
-    analysis_dir.mkdir(exist_ok=True)
+def _run_analysis(records, adapter, config, analysis_dir, rng):
+    """Stage 4: per-layer hard+soft JSD, sentence+token permutation tests,
+    bootstrap CIs. Idempotent via artifact presence + schema check."""
     layers_present = sorted(next(iter(records.values())).per_sentence_selected.keys())
+    artifacts = [analysis_dir / "jsd_by_layer.json",
+                 analysis_dir / "permutation_tests.csv",
+                 analysis_dir / "bootstrap_cis.csv"]
+    if all(p.exists() for p in artifacts):
+        existing = json.loads((analysis_dir / "jsd_by_layer.json").read_text(encoding="utf-8"))
+        if "matrix_hard" in next(iter(existing.values()), {}):
+            return layers_present
 
-    rng = np.random.default_rng(config["seed"])
-    analysis_artifacts = [analysis_dir / "jsd_by_layer.json",
-                          analysis_dir / "permutation_tests.csv",
-                          analysis_dir / "bootstrap_cis.csv"]
-    run_stage_4 = True
-    if all(p.exists() for p in analysis_artifacts):
-        # only trust existing artifacts if they're the current schema —
-        # old-format ones (single hard-only "matrix" key) must be recomputed
-        existing = json.loads((analysis_dir / "jsd_by_layer.json").read_text())
-        first_layer = next(iter(existing.values()), {})
-        if "matrix_hard" in first_layer:
-            print("  [resume] analysis artifacts already exist (current schema), skipping stage 4")
-            run_stage_4 = False
-        else:
-            print("  [resume] analysis artifacts are old-schema — recomputing stage 4")
+    jsd_by_layer, permtest_rows, bootstrap_rows = {}, [], []
+    n_perms = config["routing"]["permutation_test"]["n_permutations"]
+    n_boot = config["routing"]["bootstrap"]["n_resamples"]
+    ne = adapter.num_routed_experts
 
-    jsd_by_layer = {}
-    permtest_rows = []
-    bootstrap_rows = []
-
-    for layer_idx in layers_present if run_stage_4 else []:
-        matrix_hard, lang_order = routing_mod.pairwise_jsd_matrix(
-            records, layer_idx, adapter.num_routed_experts, metric="hard")
-        matrix_soft, _ = routing_mod.pairwise_jsd_matrix(
-            records, layer_idx, adapter.num_routed_experts, metric="soft")
-        jsd_by_layer[layer_idx] = {
-            "matrix_hard": matrix_hard.tolist(),
-            "matrix_soft": matrix_soft.tolist(),
-            "lang_order": lang_order,
-        }
-
-        n_perms = config["routing"]["permutation_test"]["n_permutations"]
+    for layer_idx in layers_present:
+        mh, lang_order = routing_mod.pairwise_jsd_matrix(records, layer_idx, ne, metric="hard")
+        ms, _ = routing_mod.pairwise_jsd_matrix(records, layer_idx, ne, metric="soft")
+        jsd_by_layer[layer_idx] = {"matrix_hard": mh.tolist(), "matrix_soft": ms.tolist(),
+                                   "lang_order": lang_order}
         for i, a in enumerate(lang_order):
             for j, b in enumerate(lang_order):
                 if i >= j:
                     continue
-                sents_a = records[a].per_sentence_selected[layer_idx]
-                sents_b = records[b].per_sentence_selected[layer_idx]
-
-                # primary: sentence-level null
-                pt_sent = routing_mod.permutation_test_sentences(
-                    sents_a, sents_b, adapter.num_routed_experts, n_perms, rng)
-                permtest_rows.append({"layer": layer_idx, "lang_a": a, "lang_b": b,
-                                      "unit": "sentence", **pt_sent})
-
-                # supplementary: token-level null (pilot-comparable, anticonservative)
-                sel_a = np.concatenate(sents_a, axis=0)
-                sel_b = np.concatenate(sents_b, axis=0)
-                pt_tok = routing_mod.permutation_test(
-                    sel_a, sel_b, adapter.num_routed_experts, n_perms, rng)
-                permtest_rows.append({"layer": layer_idx, "lang_a": a, "lang_b": b,
-                                      "unit": "token", **pt_tok})
-
-                bt = routing_mod.bootstrap_jsd_ci(
-                    records[a], records[b], layer_idx, adapter.num_routed_experts,
-                    config["routing"]["bootstrap"]["n_resamples"], rng,
-                )
+                sa = records[a].per_sentence_selected[layer_idx]
+                sb = records[b].per_sentence_selected[layer_idx]
+                pt_sent = routing_mod.permutation_test_sentences(sa, sb, ne, n_perms, rng)
+                permtest_rows.append({"layer": layer_idx, "lang_a": a, "lang_b": b, "unit": "sentence", **pt_sent})
+                pt_tok = routing_mod.permutation_test(np.concatenate(sa, 0), np.concatenate(sb, 0), ne, n_perms, rng)
+                permtest_rows.append({"layer": layer_idx, "lang_a": a, "lang_b": b, "unit": "token", **pt_tok})
+                bt = routing_mod.bootstrap_jsd_ci(records[a], records[b], layer_idx, ne, n_boot, rng)
                 bootstrap_rows.append({"layer": layer_idx, "lang_a": a, "lang_b": b, **bt})
 
-        print(f"  layer {layer_idx}: hard+soft JSD matrices + {len(lang_order)*(len(lang_order)-1)//2} "
-              f"pairwise permutation tests (sentence+token) + bootstrap CIs done")
+    (analysis_dir / "jsd_by_layer.json").write_text(json.dumps(jsd_by_layer, indent=2), encoding="utf-8")
+    pd.DataFrame(permtest_rows).to_csv(analysis_dir / "permutation_tests.csv", index=False)
+    pd.DataFrame(bootstrap_rows).to_csv(analysis_dir / "bootstrap_cis.csv", index=False)
+    return layers_present
 
-    if run_stage_4:
-        (analysis_dir / "jsd_by_layer.json").write_text(json.dumps(jsd_by_layer, indent=2))
-        pd.DataFrame(permtest_rows).to_csv(analysis_dir / "permutation_tests.csv", index=False)
-        pd.DataFrame(bootstrap_rows).to_csv(analysis_dir / "bootstrap_cis.csv", index=False)
-        print(f"Saved intermediate artifacts to {analysis_dir}")
 
-    # ---- Stage 5: ablation study (targeted + random control) ----
-    ablation_dir = out_dir / "04_ablation"
-    ablation_dir.mkdir(exist_ok=True)
+def _run_ablation(records, samples, adapter, config, layers_present, ablation_dir, rng):
     ablation_csv = ablation_dir / "ablation_results.csv"
-
     if ablation_csv.exists():
-        print(f"  [resume] ablation study already complete, skipping")
-    else:
-        per_lang_layer_dist = {
-            lang: {
-                layer: routing_mod.expert_distribution(
-                    np.concatenate(rec.per_sentence_selected[layer], axis=0), adapter.num_routed_experts
-                )
-                for layer in layers_present
-            }
-            for lang, rec in records.items()
-        }
+        return
+    per_lang_layer_dist = {
+        lang: {layer: routing_mod.expert_distribution(
+            np.concatenate(rec.per_sentence_selected[layer], 0), adapter.num_routed_experts)
+            for layer in layers_present}
+        for lang, rec in records.items()
+    }
+    families = {m["family"] for m in config["languages"].values()}
+    families_to_ablate = {}
+    for fam in families:
+        langs = [l for l, m in config["languages"].items() if m["family"] == fam and l in records]
+        if langs:
+            families_to_ablate[fam] = langs
+    test_sentences = {lang: s["sentences"] for lang, s in samples.items()}
+    rows = run_ablation_study(
+        adapter, test_sentences, config["languages"], per_lang_layer_dist, families_to_ablate,
+        config["ablation"]["top_n_experts_sweep"], config["ablation"]["n_random_controls"],
+        config["ablation"]["perplexity_max_tokens"], config["ablation"]["min_usage_floor_frac"], rng,
+    )
+    pd.DataFrame(rows).to_csv(ablation_csv, index=False)
 
-        families = {meta["family"] for meta in config["languages"].values()}
-        targeted_by_group = {}
-        for family in families:
-            group_langs = [l for l, m in config["languages"].items() if m["family"] == family and l in records]
-            if not group_langs:
-                print(f"  WARNING: family '{family}' has no languages with extracted routing records — "
-                      f"skipping it in the ablation study. This means fewer than expected family "
-                      f"groups will appear in ablation_results.csv; check for an earlier extraction failure.")
+
+def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_root: Path):
+    """Load the model once, then run every (sampling condition, seed) cell."""
+    model_cfg = config["models"][model_key]
+
+    # ---- data (once) ----
+    cache_dir = results_root / "_flores_cache"
+    flores_dir, flores_sha256 = download_flores(cache_dir, config["data"]["flores_url"], config["data"]["flores_sha256"])
+
+    # ---- top-level completion guard across the WHOLE matrix for this model ----
+    conditions = config["data"]["sampling_conditions"]
+    seeds = config["seeds"]
+    cells = [(c, s) for c in conditions for s in seeds]
+
+    def cell_dir(cond, seed):
+        return results_root / cond / f"seed{seed}" / model_key
+
+    if all((cell_dir(c, s) / "_checkpoint.json").exists()
+           and json.loads((cell_dir(c, s) / "_checkpoint.json").read_text()).get("stage") == "complete"
+           for c, s in cells):
+        print(f"{model_key}: all {len(cells)} cells already complete — skipping, no model load.")
+        return
+
+    # ---- model (once) ----
+    adapter = _adapter_for(model_cfg["adapter"])
+    adapter.knockout = config["ablation"]["knockout"]
+    print(f"Loading {model_cfg['hf_id']} ...")
+    adapter.load(model_cfg["hf_id"], model_cfg.get("revision"), model_cfg["quantization"])
+    print(f"Loaded. layers={adapter.num_layers} routed_experts={adapter.num_routed_experts} "
+          f"top_k={adapter.top_k} shared_experts={adapter.n_shared_experts} "
+          f"knockout={adapter.knockout} resolved_revision={getattr(adapter, 'resolved_revision', 'n/a')}")
+
+    for cond_name, cond_cfg in conditions.items():
+        # samples depend only on (condition, model tokenizer) — build once per condition
+        samples = None
+        for seed in seeds:
+            out_dir = cell_dir(cond_name, seed)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            ck = out_dir / "_checkpoint.json"
+            if ck.exists() and json.loads(ck.read_text()).get("stage") == "complete" \
+               and (out_dir / "04_ablation" / "ablation_results.csv").exists():
+                print(f"[{cond_name}/seed{seed}/{model_key}] complete — skipping.")
                 continue
-            targeted_by_group[family] = top_experts_for_group(
-                per_lang_layer_dist, group_langs, adapter.num_layers,
-                adapter.num_routed_experts, config["ablation"]["top_n_experts"],
-            )
 
-        test_texts = {lang: s["text"] for lang, s in samples.items()}
-        # Dedicated generator: the shared stage-4 rng's state depends on whether
-        # stage 4 ran or was resumed-past, which would make the random control
-        # expert sets non-reproducible across resume paths.
-        ablation_rng = np.random.default_rng(config["seed"] + 1)
-        ablation_rows = run_ablation_study(
-            adapter, test_texts, config["languages"], targeted_by_group,
-            config["ablation"]["n_random_controls"], config["ablation"]["top_n_experts"],
-            config["ablation"]["perplexity_max_tokens"], ablation_rng,
-        )
-        pd.DataFrame(ablation_rows).to_csv(ablation_csv, index=False)
-        print(f"Saved ablation results: {ablation_csv}")
+            print(f"\n{'='*70}\n{model_key} | condition={cond_name} | seed={seed}\n{'='*70}")
+            write_manifest(out_dir, config, config_path, extra={
+                "model_key": model_key, "sampling_condition": cond_name, "seed": seed,
+                "flores_sha256": flores_sha256, "knockout": adapter.knockout,
+                "resolved_revision": getattr(adapter, "resolved_revision", None),
+            })
 
-    checkpoint_path.write_text(json.dumps({
-        "stage": "complete",
-        # methods-relevant: which router return format the adapter saw, which
-        # determines the exact ablation mechanism used (renormalize surviving
-        # top-k weights for the tuple format vs. -inf logits forcing top-k
-        # re-selection for the tensor format)
-        "gate_output_format": getattr(adapter, "gate_output_format", "n/a"),
-    }))
-    print(f"\n{model_key}: pipeline complete. All artifacts under {out_dir}")
-    return out_dir
+            if samples is None:
+                print("  building samples ...")
+                samples = _build_samples(config, adapter, flores_dir, cond_name, cond_cfg)
+                # persist the sampled sentences (once per condition; identical across seeds)
+                cond_samples_path = results_root / cond_name / "01_samples.json"
+                cond_samples_path.parent.mkdir(parents=True, exist_ok=True)
+                cond_samples_path.write_text(json.dumps(
+                    {l: {k: v for k, v in s.items() if k != "sentences"} | {"n_sentences": s["n_sentences"]}
+                     for l, s in samples.items()}, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            hooks = adapter.register_hooks()
+            extraction_dir = out_dir / "02_routing_raw"; extraction_dir.mkdir(exist_ok=True)
+            records = _extract_routing(adapter, samples, extraction_dir)
+            for h in hooks:
+                h.remove()
+
+            analysis_dir = out_dir / "03_analysis"; analysis_dir.mkdir(exist_ok=True)
+            layers_present = _run_analysis(records, adapter, config, analysis_dir, np.random.default_rng(seed))
+
+            ablation_dir = out_dir / "04_ablation"; ablation_dir.mkdir(exist_ok=True)
+            _run_ablation(records, samples, adapter, config, layers_present, ablation_dir,
+                          np.random.default_rng(seed + 1))
+
+            ck.write_text(json.dumps({
+                "stage": "complete",
+                "gate_output_format": getattr(adapter, "gate_output_format", "n/a"),
+                "knockout": adapter.knockout,
+            }))
+            print(f"[{cond_name}/seed{seed}/{model_key}] complete.")
+
+    print(f"\n{model_key}: all cells complete.")

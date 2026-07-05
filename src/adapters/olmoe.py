@@ -97,13 +97,14 @@ class OLMoEAdapter(MoEAdapter):
         return self._captures
 
     def ablate_experts(self, experts_by_layer: dict[int, list[int]]):
-        return _OLMoEAblator(self.model, experts_by_layer)
+        return _OLMoEAblator(self.model, experts_by_layer, self.knockout)
 
 
 class _OLMoEAblator:
-    def __init__(self, model, experts_by_layer):
+    def __init__(self, model, experts_by_layer, knockout="drop"):
         self.model = model
         self.experts_by_layer = experts_by_layer
+        self.knockout = knockout
         self.hooks = []
 
     def __enter__(self):
@@ -111,7 +112,7 @@ class _OLMoEAblator:
             if layer_idx not in self.experts_by_layer:
                 continue
             to_zero = self.experts_by_layer[layer_idx]
-            self.hooks.append(layer.mlp.gate.register_forward_hook(self._make_ablation_hook(to_zero)))
+            self.hooks.append(layer.mlp.gate.register_forward_hook(self._make_ablation_hook(to_zero, self.knockout)))
         return self
 
     def __exit__(self, *args):
@@ -120,25 +121,33 @@ class _OLMoEAblator:
         self.hooks = []
 
     @staticmethod
-    def _make_ablation_hook(experts_to_zero):
+    def _make_ablation_hook(experts_to_zero, knockout):
         def hook(module, inputs, output):
             if isinstance(output, tuple) and len(output) >= 3:
-                # newer transformers: zero the routing weights of ablated
-                # experts and renormalize the survivors
+                # newer transformers: (logits, weights, selected). Zero the
+                # ablated experts' routing weight; then EITHER renormalize the
+                # survivors ("renorm") OR leave the remaining weights as-is
+                # ("drop" -- removes the ablated experts' contribution without
+                # upweighting neighbors; the cleaner causal test, critique #18).
                 logits, weights, selected = output[0], output[1], output[2]
                 mask = torch.zeros_like(selected, dtype=torch.bool)
                 for expert_id in experts_to_zero:
                     mask = mask | (selected == expert_id)
                 weights = weights.clone()
                 weights[mask] = 0.0
-                row_sum = weights.sum(dim=-1, keepdim=True)
-                row_sum = torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum))
-                weights = weights / row_sum
+                if knockout == "renorm":
+                    row_sum = weights.sum(dim=-1, keepdim=True)
+                    row_sum = torch.where(row_sum > 0, row_sum, torch.ones_like(row_sum))
+                    weights = weights / row_sum
                 return (logits, weights, selected)
             elif torch.is_tensor(output):
-                # older transformers: gate returns raw logits and the MoE block
-                # does softmax/top-k downstream — force ablated experts to -inf
-                # so they can never be selected
+                # older transformers: gate returns raw logits, MoE block does
+                # softmax/top-k downstream. Forcing ablated experts to -inf makes
+                # top-k re-select from the survivors and re-softmax over them --
+                # which is inherently a RENORM over the remaining experts. A true
+                # "drop" isn't cleanly expressible at the logits level here, so
+                # this branch always behaves as renorm; the tuple branch above is
+                # the one that honors knockout=="drop".
                 logits = output.clone()
                 logits[..., experts_to_zero] = float("-inf")
                 return logits

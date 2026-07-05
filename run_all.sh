@@ -133,7 +133,11 @@ export HF_HUB_OFFLINE=1
 echo "HF_HUB_OFFLINE=1 set — pipeline will only read from the cache prefetch just populated."
 
 echo ""
-echo "=== [4/4] Running full pipeline (olmoe -> qwen_moe -> deepseek_moe) ==="
+echo "=== [4/4] Running full pipeline ==="
+echo "    Each model (olmoe -> qwen_moe -> deepseek_moe) is loaded ONCE and run"
+echo "    across the full matrix: 2 sampling conditions (token_capped, aligned)"
+echo "    x 2 seeds. Results land in results/<condition>/seed<N>/<model>/."
+echo "    Extraction is fast; the expensive step (model download) already happened."
 python3 scripts/run_all_models.py
 
 echo ""
