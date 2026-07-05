@@ -6,10 +6,26 @@ causal or incidental?**
 
 This repository analyzes the router behavior of three open MoE models on
 parallel Indic text, with no training involved. It tests, on 11 Indian
-languages across two families and many scripts, whether the routing patterns
-that [Mixtral](https://arxiv.org/abs/2401.04088) reported as *syntactic rather
-than semantic* hold when the languages are Indic — a setting no prior expert-
-specialization study covered.
+languages across two families and many scripts, whether the routing behavior
+[Mixtral](https://arxiv.org/abs/2401.04088) reported holds when the languages
+are Indic — a setting no prior expert-specialization study covered.
+
+**What Mixtral actually found** (Jiang et al. 2024, §5 "Routing analysis"): the
+router shows *no* topic/domain specialization — "*we do not observe obvious
+patterns in the assignment of experts based on the topic*" (expert distribution
+is near-identical across ArXiv, PubMed, and PhilPapers text, their Figure 7) —
+but *does* show "*structured syntactic behavior*", routing by token-level and
+positional features (e.g. `self` in Python and `Question` in English go to the
+same expert; consecutive tokens and indentation cluster; their Figure 8 /
+Table 5). Their evidence is entirely English + code. **Whether that
+topic-invariant, syntax-driven picture survives when the "domain" is instead a
+different *language* or *script* is exactly what no one had checked — and what
+this study measures.** Note that in our setting "does routing separate
+languages/families?" is a sharper question than Mixtral's topic test: language
+and script are much stronger surface/structural signals than document topic, so
+finding language-family structure does not by itself contradict Mixtral — the
+informative results are the *script-vs-language* control (Hindi–Urdu) and the
+per-architecture differences, below.
 
 <p align="center">
   <img src="results/figures/dendrogram_olmoe.png" width="70%"><br>
@@ -40,9 +56,12 @@ Measured across **OLMoE-1B-7B** (64 experts, no shared, English-heavy training),
    script wins); **DeepSeek** sits in between (ratio 0.93, roughly tied). So on
    this control the three models disagree, and the ordering runs *opposite* to
    the naive expectation: the model with the least multilingual training shows
-   the strongest language-identity (script-invariant) routing. This is
-   consistent with Mixtral's "routing is syntactic/script-like" claim for Qwen,
-   ambiguous for DeepSeek, and contrary to it for OLMoE — i.e. the claim is
+   the strongest language-identity (script-invariant) routing. Reading this
+   through Mixtral's lens — where routing tracked token-level/structural
+   features (of which script is one) rather than higher-level meaning — Qwen's
+   script-driven routing is consistent with it, DeepSeek is ambiguous, and
+   OLMoE (routing by language identity *across* scripts) runs contrary to it —
+   i.e. the pattern is
    architecture-dependent, not universal, on Indic text.
 
 3. **Specialization broadly increases with layer depth**, with a distinct
@@ -189,6 +208,20 @@ python tests/test_routing.py
 Languages (FLORES-200): English (control) plus Hindi, Marathi, Bengali,
 Gujarati, Punjabi, Urdu (Indo-Aryan) and Tamil, Telugu, Malayalam, Kannada
 (Dravidian).
+
+## References
+
+- Jiang et al. (2024), **Mixtral of Experts**, arXiv:2401.04088. §5 "Routing
+  analysis" is the source of the routing-behavior claim this study tests:
+  no observed topic/domain specialization, but structured syntactic /
+  token-level routing (Figures 7–8, Table 5). Quotes above are verbatim from
+  that section.
+- Muennighoff et al. (2024), **OLMoE: Open Mixture-of-Experts Language Models**,
+  arXiv:2409.02060.
+- Team, **Qwen1.5-MoE**, https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B.
+- Dai et al. (2024), **DeepSeekMoE**, arXiv:2401.06066 (architecture of
+  `deepseek-moe-16b-base`).
+- NLLB Team (2022), **FLORES-200** evaluation benchmark, arXiv:2207.04672.
 
 ## License
 
