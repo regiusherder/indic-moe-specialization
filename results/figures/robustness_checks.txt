@@ -1,0 +1,59 @@
+==============================================================================
+CHECK 1: does the SOFT-routing metric agree with the HARD (primary) metric?
+==============================================================================
+(Spearman rank correlation across all pairwise JSDs; then whether the two
+ headline ratios -- family separation, Hindi-Urdu -- point the same direction)
+
+olmoe:
+  Spearman rho (hard vs soft, all 55 pairs): 0.974 (p=6.27e-36)
+  family within/cross ratio:  hard=0.563  soft=0.584  AGREE (both <1)
+  Hindi-Urdu ratio:           hard=0.564  soft=0.620  AGREE (both same side of 1)
+
+qwen_moe:
+  Spearman rho (hard vs soft, all 55 pairs): 0.893 (p=5.65e-20)
+  family within/cross ratio:  hard=0.835  soft=0.815  AGREE (both <1)
+  Hindi-Urdu ratio:           hard=1.582  soft=2.794  AGREE (both same side of 1)
+
+deepseek_moe:
+  Spearman rho (hard vs soft, all 55 pairs): 0.965 (p=2.28e-32)
+  family within/cross ratio:  hard=0.840  soft=0.827  AGREE (both <1)
+  Hindi-Urdu ratio:           hard=0.930  soft=1.141  DISAGREE
+
+==============================================================================
+CHECK 2: residual fertility confound -- does tokens/char still predict
+JSD-vs-English even after token-capped sampling?
+==============================================================================
+(Spearman correlation across the 10 Indic languages; token-capping should
+ have equalized routing-decision COUNT, but not necessarily eliminate any
+ relationship between how fragmented a script is and how it routes)
+
+olmoe: fertility vs JSD-vs-English, n=10 languages
+  Spearman rho=0.721  p=0.019  SIGNIFICANT correlation -- interpret family/script findings with this in mind
+  (sorted by fertility) urdu=0.92/0.375, hindi=0.98/0.348, marathi=1.05/0.409, tamil=1.37/0.456, bengali=1.37/0.412, telugu=1.47/0.463, gujarati=1.49/0.424, malayalam=1.61/0.475, kannada=1.71/0.471, punjabi=1.78/0.417
+
+qwen_moe: fertility vs JSD-vs-English, n=10 languages
+  Spearman rho=0.309  p=0.385  not significant at p<0.05
+  (sorted by fertility) urdu=0.67/0.177, hindi=0.92/0.114, marathi=0.95/0.153, bengali=1.07/0.125, tamil=1.09/0.147, malayalam=1.33/0.133, kannada=1.38/0.171, telugu=1.44/0.170, gujarati=1.47/0.146, punjabi=1.49/0.181
+
+deepseek_moe: fertility vs JSD-vs-English, n=10 languages
+  Spearman rho=-0.576  p=0.082  not significant at p<0.05
+  (sorted by fertility) urdu=0.99/0.178, marathi=1.21/0.189, hindi=1.25/0.127, bengali=1.82/0.140, tamil=1.85/0.137, gujarati=1.97/0.124, telugu=1.98/0.117, kannada=2.04/0.124, malayalam=2.11/0.124, punjabi=2.54/0.150
+
+==============================================================================
+CHECK 3: GROUP-level permutation test -- is within-vs-cross-family JSD gap
+itself larger than chance (not just individual pair significance)?
+==============================================================================
+(Shuffle Indo-Aryan/Dravidian family labels among the 10 Indic languages,
+ 2000 times, rebuild the null distribution of the within/cross gap)
+
+olmoe: observed (cross-within) gap = 0.0169
+  null mean=0.0001 null std=0.0041
+  p-value = 0.0080 (SIGNIFICANT: the true Indo-Aryan/Dravidian split explains the JSD gap better than a random relabeling would)
+
+qwen_moe: observed (cross-within) gap = 0.0089
+  null mean=-0.0002 null std=0.0047
+  p-value = 0.0350 (SIGNIFICANT: the true Indo-Aryan/Dravidian split explains the JSD gap better than a random relabeling would)
+
+deepseek_moe: observed (cross-within) gap = 0.0082
+  null mean=-0.0000 null std=0.0052
+  p-value = 0.0695 (not significant)

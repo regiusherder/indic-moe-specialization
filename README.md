@@ -41,28 +41,39 @@ Measured across **OLMoE-1B-7B** (64 experts, no shared, English-heavy training),
 **Qwen1.5-MoE-A2.7B** (60 routed + 1 shared, multilingual), and
 **deepseek-moe-16b-base** (64 routed + 2 shared, multilingual):
 
-1. **Routing is family-structured in all three models.** Within-family routing
-   divergence (JSD) is lower than cross-family in every model (ratios
-   0.56–0.84), with 100% of language pairs significant under a sentence-level
-   permutation test. The Dravidian/Indo-Aryan split emerges with zero
-   supervision.
+1. **Routing is family-structured in OLMoE and Qwen; weaker/unclear for
+   DeepSeek at the group level.** Within-family routing divergence (JSD) is
+   lower than cross-family in every model (ratios 0.56–0.84), and per-pair,
+   100% of language pairs are significant under a sentence-level permutation
+   test. But that per-pair test only shows *some* pairs differ — it doesn't
+   test the family-structure claim directly. We added that test: shuffle the
+   Indo-Aryan/Dravidian labels among the 10 Indic languages and ask whether
+   the *true* labeling explains the within/cross JSD gap better than a random
+   relabeling would. Result: **significant for OLMoE (p=0.008) and Qwen
+   (p=0.035), not significant for DeepSeek (p=0.070)** at the group level,
+   even though DeepSeek's pairwise ratio (0.840) looks similar to Qwen's
+   (0.835) on paper. The Dravidian/Indo-Aryan split emerges with zero
+   supervision, most convincingly in OLMoE and Qwen.
 
-2. **The Hindi–Urdu control splits by architecture.** Hindi and Urdu are
-   nearly the same spoken language written in different scripts (Devanagari vs
-   Perso-Arabic), so they cleanly separate *language identity* from *script*.
-   The English-heavy **OLMoE** routes them together (Hindi–Urdu JSD *below*
-   Hindi's mean to its other Indo-Aryan relatives, ratio 0.56 — language
-   identity wins); the multilingual **Qwen** routes them apart (ratio 1.58 —
-   script wins); **DeepSeek** sits in between (ratio 0.93, roughly tied). So on
-   this control the three models disagree, and the ordering runs *opposite* to
-   the naive expectation: the model with the least multilingual training shows
-   the strongest language-identity (script-invariant) routing. Reading this
-   through Mixtral's lens — where routing tracked token-level/structural
-   features (of which script is one) rather than higher-level meaning — Qwen's
-   script-driven routing is consistent with it, DeepSeek is ambiguous, and
-   OLMoE (routing by language identity *across* scripts) runs contrary to it —
-   i.e. the pattern is
-   architecture-dependent, not universal, on Indic text.
+2. **The Hindi–Urdu control splits by architecture — but check the metric.**
+   Hindi and Urdu are nearly the same spoken language written in different
+   scripts (Devanagari vs Perso-Arabic), so they cleanly separate *language
+   identity* from *script*. The English-heavy **OLMoE** routes them together
+   (ratio 0.56, language identity wins) and the multilingual **Qwen** routes
+   them apart (ratio 1.58, script wins) — both **robust**: the same
+   conclusion holds whether you use hard top-k selection counts (primary
+   metric) or the full soft routing distribution (secondary metric, rho=0.97
+   and 0.89 rank-correlated with hard, respectively). **DeepSeek is the one
+   case that isn't robust to metric choice**: ratio 0.93 (roughly tied) under
+   hard routing but 1.14 (mild script preference) under soft routing — the
+   two metrics disagree on which side of 1.0 it lands, so DeepSeek's
+   Hindi-Urdu result should be read as genuinely ambiguous, not just
+   "intermediate." Reading OLMoE/Qwen through Mixtral's lens — where routing
+   tracked token-level/structural features (of which script is one) rather
+   than higher-level meaning — Qwen's script-driven routing is consistent
+   with it and OLMoE (routing by language identity *across* scripts) runs
+   contrary to it: the pattern is architecture-dependent, not universal, on
+   Indic text.
 
 3. **Specialization broadly increases with layer depth**, with a distinct
    signature per architecture. In OLMoE the Dravidian/Indo-Aryan ordering is
@@ -93,6 +104,24 @@ Measured across **OLMoE-1B-7B** (64 experts, no shared, English-heavy training),
    Qwen's is a much larger +0.35) — this is evidence of causal, family-linked
    experts, not proof that every family is equally cleanly separated in every
    architecture.
+
+5. **A confound we designed against isn't fully closed for OLMoE.**
+   Token-capped sampling (below) was meant to equalize routing-decision count
+   per language regardless of tokenizer fertility. It does that. But it
+   doesn't necessarily break every relationship between fertility and
+   routing: a direct check finds tokenizer fertility (tokens/char) still
+   correlates with a language's JSD-vs-English in **OLMoE** (Spearman
+   rho=0.72, p=0.019) — higher-fertility languages (mostly Dravidian, which
+   fragment more) tend to diverge from English more, and family and
+   fertility are correlated with each other in this language set, so this
+   isn't fully separable from the family-structure finding. Qwen (rho=0.31,
+   p=0.39) and DeepSeek (rho=−0.58, p=0.08) don't show a significant
+   correlation. This doesn't overturn OLMoE's family-structure result (the
+   group-level permutation test above still controls for exactly this kind
+   of confound and remains significant), but it means fertility is not fully
+   ruled out as a *contributing* factor for OLMoE specifically, and is worth
+   controlling for more directly in any follow-up (e.g. deliberately pairing
+   high- and low-fertility languages within each family).
 
 ### The numbers
 
@@ -162,7 +191,22 @@ all figures are in [`results/figures/`](results/figures/).
 
 - **Causal test.** For each language family, identify its most
   disproportionately-used experts, ablate them, and measure the loss increase —
-  compared against a baseline of ablating the same number of *random* experts.
+  compared against a baseline of ablating the same number of *random* experts,
+  restricted to that same family's languages (an earlier pooled-baseline
+  version of this test was corrected mid-project — see `WALKTHROUGH.md`-style
+  notes in the git history / `scripts/analyze_results.py`'s docstring).
+
+- **Robustness checks** (`scripts/robustness_checks.py`, no GPU): (1) does the
+  soft-routing metric agree with the primary hard-routing metric on the
+  headline numbers? (2) does tokenizer fertility still correlate with
+  JSD-vs-English after token-capped sampling — i.e. is the fertility confound
+  actually closed? (3) is the within/cross-family JSD gap itself significant
+  under a label-shuffling permutation test, not just individual language
+  pairs? Results are reported honestly including where they don't fully
+  support the headline claims (DeepSeek's Hindi-Urdu result flips sign
+  between metrics; OLMoE shows a residual fertility correlation) — see
+  finding 5 above and
+  [`results/figures/robustness_checks.txt`](results/figures/robustness_checks.txt).
 
 Every architecture-specific detail lives in `src/adapters/`; the analysis code
 (`src/routing.py`, `src/ablation.py`) is model-agnostic. Adding a fourth model
@@ -188,6 +232,13 @@ scripts/
   run_all_models.py          Run all three, continue past a per-model failure
   prefetch_model.py          Robust model-weight download (parallel, resumable)
   analyze_results.py         results/ -> figures + findings summary (no GPU needed)
+  explore_families.py        Per-language (not just per-family-mean) deep dive:
+                             pairwise breakdowns, family outliers, per-language
+                             ablation, bootstrap CI widths (no GPU needed)
+  robustness_checks.py       Soft-vs-hard metric agreement, fertility-confound
+                             check, group-level family permutation test (no GPU)
+  verify_tokenization.py     Confirms no language collapses to <unk>/control
+                             tokens/replacement chars (no GPU needed)
 tests/
   test_routing.py            Unit tests for the statistical core
 results/                     Published outputs (figures + per-layer JSD, permutation,
@@ -217,6 +268,9 @@ Run just the analysis on the committed results without a GPU:
 ```bash
 pip install -r requirements.txt
 python scripts/analyze_results.py --results ./results --out /tmp/figs
+python scripts/explore_families.py --results ./results --out /tmp/figs
+python scripts/robustness_checks.py --results ./results --out /tmp/figs
+python scripts/verify_tokenization.py --results ./results
 ```
 
 Unit tests for the statistics (CPU-only):
