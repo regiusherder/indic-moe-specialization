@@ -80,27 +80,52 @@ def _build_samples(config, adapter, flores_dir, condition_name, condition_cfg):
                               "n_sentences": len(sents), "n_tokens_est": n_tok}
         print(f"  {lang_name:<14s} [{condition_name}] {len(sents)} sentences"
               + (f", ~{n_tok} tokens" if n_tok else " (aligned; tokens vary)"))
+
+    # For the aligned condition, every language MUST have the same number of
+    # sentences -- that's the entire point (identical content, index-aligned).
+    # If a FLORES file were short, they'd silently misalign; fail loud instead.
+    if condition_name == "aligned":
+        counts = {l: s["n_sentences"] for l, s in samples.items()}
+        if len(set(counts.values())) != 1:
+            raise RuntimeError(
+                f"aligned condition requires identical sentence counts across "
+                f"languages, but got {counts}. A FLORES file may be shorter than "
+                f"n_aligned_sentences; lower it or drop the short language.")
     return samples
 
 
 def _extract_routing(adapter, samples, extraction_dir):
-    """Per-language, per-sentence routing extraction with per-language checkpoints."""
+    """Per-language, per-sentence routing extraction with per-language checkpoints.
+
+    Not batched on purpose: extraction is <1% of a cell's compute (the ablation
+    stage dominates), and batching the router hooks would require splitting a
+    (batch*seq, experts) capture back per-sentence while excluding pad rows --
+    an error-prone reshape on the CORE measurement. Single-sentence extraction
+    keeps the routing data trivially correct; the speed is spent where it
+    matters (batched ablation loss). Verbose so progress is always visible.
+    """
+    import time
     import torch
+    from tqdm import tqdm
     records = {}
-    for lang_name, sample in samples.items():
+    n_langs = len(samples)
+    stage_t0 = time.time()
+    for li, (lang_name, sample) in enumerate(samples.items(), 1):
         lang_ckpt = extraction_dir / f"{lang_name}.pkl"
         if lang_ckpt.exists():
             with open(lang_ckpt, "rb") as f:
                 loaded = pickle.load(f)
             if _routing_checkpoint_is_valid(loaded, adapter.num_routed_experts):
                 records[lang_name] = loaded
+                print(f"    [{li}/{n_langs}] {lang_name}: reused checkpoint ({loaded.n_sentences} sentences)")
                 continue
             lang_ckpt.unlink(missing_ok=True)
 
-        print(f"    extracting routing for {lang_name} ...")
         per_sentence_selected, per_sentence_prob_sums, per_sentence_token_counts = {}, {}, []
         n_tokens_actual = 0
-        for sentence in sample["sentences"]:
+        bar = tqdm(sample["sentences"], desc=f"    [{li}/{n_langs}] extract {lang_name}",
+                   unit="sent", leave=False)
+        for sentence in bar:
             adapter.clear_captures()
             inputs = adapter.tokenizer(sentence, return_tensors="pt", truncation=True,
                                        max_length=512).to(adapter.model.device)
@@ -109,7 +134,13 @@ def _extract_routing(adapter, samples, extraction_dir):
             per_sentence_token_counts.append(n_tok)
             with torch.no_grad():
                 _ = adapter.model(**inputs)
-            for layer_idx, cap in adapter.get_captures().items():
+            captures = adapter.get_captures()
+            if not captures:
+                raise RuntimeError(
+                    f"No routing captured for a sentence in '{lang_name}'. The forward "
+                    f"hooks didn't fire -- the model's router module path likely changed. "
+                    f"Refusing to save empty routing data.")
+            for layer_idx, cap in captures.items():
                 per_sentence_selected.setdefault(layer_idx, []).append(cap.selected_experts.numpy())
                 per_sentence_prob_sums.setdefault(layer_idx, []).append(cap.routing_probs.sum(dim=0).numpy())
 
@@ -123,6 +154,11 @@ def _extract_routing(adapter, samples, extraction_dir):
         records[lang_name] = record
         with open(lang_ckpt, "wb") as f:
             pickle.dump(record, f)
+        elapsed = time.time() - stage_t0
+        done_new = li  # rough; includes reused, fine for a coarse ETA
+        eta = (elapsed / done_new) * (n_langs - done_new) if done_new else 0
+        print(f"    [{li}/{n_langs}] {lang_name}: {sample['n_sentences']} sentences, "
+              f"{n_tokens_actual} tokens extracted (~{eta/60:.1f}min left in this stage)")
     return records
 
 
@@ -138,12 +174,19 @@ def _run_analysis(records, adapter, config, analysis_dir, rng):
         if "matrix_hard" in next(iter(existing.values()), {}):
             return layers_present
 
+    import time
+    from tqdm import tqdm
     jsd_by_layer, permtest_rows, bootstrap_rows = {}, [], []
     n_perms = config["routing"]["permutation_test"]["n_permutations"]
     n_boot = config["routing"]["bootstrap"]["n_resamples"]
     ne = adapter.num_routed_experts
+    n_pairs = len(layers_present) * len(records) * (len(records) - 1) // 2
+    print(f"    analysis: {len(layers_present)} layers x {len(records)*(len(records)-1)//2} "
+          f"language pairs = {n_pairs} pairwise tests "
+          f"({n_perms} perms + {n_boot} bootstrap each). CPU-bound.")
+    t0 = time.time()
 
-    for layer_idx in layers_present:
+    for layer_idx in tqdm(layers_present, desc="    analysis (per layer)", unit="layer"):
         mh, lang_order = routing_mod.pairwise_jsd_matrix(records, layer_idx, ne, metric="hard")
         ms, _ = routing_mod.pairwise_jsd_matrix(records, layer_idx, ne, metric="soft")
         jsd_by_layer[layer_idx] = {"matrix_hard": mh.tolist(), "matrix_soft": ms.tolist(),
@@ -164,6 +207,7 @@ def _run_analysis(records, adapter, config, analysis_dir, rng):
     (analysis_dir / "jsd_by_layer.json").write_text(json.dumps(jsd_by_layer, indent=2), encoding="utf-8")
     pd.DataFrame(permtest_rows).to_csv(analysis_dir / "permutation_tests.csv", index=False)
     pd.DataFrame(bootstrap_rows).to_csv(analysis_dir / "bootstrap_cis.csv", index=False)
+    print(f"    analysis done in {(time.time()-t0)/60:.1f}min")
     return layers_present
 
 
@@ -188,6 +232,7 @@ def _run_ablation(records, samples, adapter, config, layers_present, ablation_di
         adapter, test_sentences, config["languages"], per_lang_layer_dist, families_to_ablate,
         config["ablation"]["top_n_experts_sweep"], config["ablation"]["n_random_controls"],
         config["ablation"]["perplexity_max_tokens"], config["ablation"]["min_usage_floor_frac"], rng,
+        loss_batch_size=config["ablation"].get("loss_batch_size", 16),
     )
     pd.DataFrame(rows).to_csv(ablation_csv, index=False)
 

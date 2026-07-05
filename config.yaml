@@ -70,9 +70,11 @@ data:
       max_sentences_pool: 1012
     # (b) same ALIGNED sentences for every language: identical content across
     #     languages (FLORES is sentence-aligned), but token counts then differ
-    #     by fertility. n_sentences = the full devtest set.
+    #     by fertility. 200 sentences keeps this condition fast while still
+    #     giving every language identical CONTENT (the point of the condition);
+    #     content-control, not sample size, is what this condition contributes.
     aligned:
-      n_aligned_sentences: 1012   # full FLORES-200 devtest; identical indices for all languages
+      n_aligned_sentences: 200
 
 routing:
   # JSD is computed per-layer using routed experts only (shared experts, where
@@ -90,6 +92,12 @@ ablation:
   top_n_experts_sweep: [4, 8, 16]
   n_random_controls: 10   # random-expert-ablation trials, for the causal control
   perplexity_max_tokens: 2000
+  # batch_size: sentences per forward pass when measuring per-sentence loss.
+  # Single-sentence passes barely use a modern GPU (~7% util); batching gives
+  # a large speedup. Per-sentence granularity is preserved (loss is computed
+  # per row with padding masked out). 16 is safe on a 24-32GB card at these
+  # short FLORES sentence lengths; raise for more speed if memory allows.
+  loss_batch_size: 16
   # min_usage_floor (critique #16): when picking "family-preferring" experts by
   # target/other usage RATIO, ignore experts whose overall usage is below this
   # fraction of uniform (1/n_experts). Without a floor the +1e-8 smoothing lets
