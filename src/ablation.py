@@ -49,26 +49,64 @@ def _reference_single_loss(model, tokenizer, sentence: str, max_tokens: int) -> 
         return float(model(**inputs, labels=inputs["input_ids"]).loss.item())
 
 
-def verify_batched_loss(model, tokenizer, sentences: list[str], max_tokens: int, batch_size: int, n_check: int = 5):
+def verify_batched_loss(model, tokenizer, sentences: list[str], max_tokens: int, batch_size: int, n_check: int = 8):
     """Fail loud if the batched per-sentence loss disagrees with the unbatched
-    reference on a handful of sentences. Called once before the ablation loop."""
-    check = [s for s in sentences[:n_check] if len(s.split()) >= 2][:n_check]
-    if not check:
+    reference. Compares ONLY sentences that survive BOTH paths' token-count
+    filter (a word-count filter would misalign, since batched and reference
+    both drop <2-TOKEN sentences, not <2-word ones -- verifying element by
+    element by re-tokenizing each candidate so we never compare a dropped
+    sentence against a NaN)."""
+    import torch
+    candidates = sentences[:n_check * 3]  # over-sample; some may be too short
+    pairs = []  # (batched_loss, reference_loss) for sentences valid in both
+    for s in candidates:
+        # reference on this single sentence (NaN if <2 tokens)
+        ref = _reference_single_loss(model, tokenizer, s, max_tokens)
+        if not np.isfinite(ref):
+            continue
+        # batched path on this single sentence
+        b = per_sentence_losses(model, tokenizer, [s], max_tokens, batch_size=batch_size)
+        if len(b) != 1:
+            continue  # batched also dropped it -> not comparable, skip
+        pairs.append((float(b[0]), ref))
+        if len(pairs) >= n_check:
+            break
+    if not pairs:
+        print("    [warn] no sentences long enough to verify batched loss; skipping check")
         return
-    batched = per_sentence_losses(model, tokenizer, check, max_tokens, batch_size=batch_size)
-    ref = np.array([_reference_single_loss(model, tokenizer, s, max_tokens) for s in check])
-    # align (batched may drop <2-token sentences, but we pre-filtered check)
-    if len(batched) != len(ref):
-        raise RuntimeError(f"batched loss returned {len(batched)} values, reference {len(ref)} -- length mismatch")
+    batched = np.array([p[0] for p in pairs])
+    ref = np.array([p[1] for p in pairs])
     diff = np.abs(batched - ref)
-    if np.nanmax(diff) > 1e-3:
+    if np.max(diff) > 1e-3:
         raise RuntimeError(
-            f"Batched per-sentence loss disagrees with unbatched reference by up to "
-            f"{np.nanmax(diff):.4f} (batched={batched}, ref={ref}). A padding/masking/shift "
-            f"bug would corrupt every ablation number -- refusing to proceed."
+            f"Batched per-sentence loss (single) disagrees with unbatched reference by up to "
+            f"{np.max(diff):.4f} (batched={batched}, ref={ref}) -- refusing to proceed."
         )
-    print(f"    [ok] batched per-sentence loss matches unbatched reference "
-          f"(max diff {np.nanmax(diff):.2e} over {len(check)} sentences)")
+
+    # Critically: also verify the ACTUAL padded multi-sentence batch path (a
+    # batch of 1 has no padding, so the single-sentence check above doesn't
+    # exercise the masking that's the real risk). Run all valid candidates as
+    # one real batch and confirm each still matches its own reference.
+    valid_sents = [s for s in candidates if np.isfinite(_reference_single_loss(model, tokenizer, s, max_tokens))][:len(pairs)]
+    if len(valid_sents) >= 2:
+        batch_out = per_sentence_losses(model, tokenizer, valid_sents, max_tokens, batch_size=len(valid_sents))
+        ref2 = np.array([_reference_single_loss(model, tokenizer, s, max_tokens) for s in valid_sents])
+        if len(batch_out) != len(ref2):
+            raise RuntimeError(
+                f"padded-batch path returned {len(batch_out)} losses for {len(ref2)} "
+                f"valid sentences -- the padding/skip filter is inconsistent, refusing to proceed.")
+        bdiff = np.abs(batch_out - ref2)
+        if np.max(bdiff) > 1e-3:
+            raise RuntimeError(
+                f"PADDED multi-sentence batch disagrees with per-sentence reference by up to "
+                f"{np.max(bdiff):.4f} -- a padding/masking bug would corrupt every ablation "
+                f"delta. batch={batch_out}, ref={ref2}. Refusing to proceed."
+            )
+        print(f"    [ok] batched per-sentence loss matches reference: single (max {np.max(diff):.1e}) "
+              f"AND padded batch of {len(valid_sents)} (max {np.max(bdiff):.1e})")
+    else:
+        print(f"    [ok] batched loss matches reference (single only, max {np.max(diff):.1e}; "
+              f"too few valid sentences for a padded-batch check)")
 
 
 def per_sentence_losses(model, tokenizer, sentences: list[str], max_tokens: int,
@@ -105,10 +143,27 @@ def per_sentence_losses(model, tokenizer, sentences: list[str], max_tokens: int,
         if attn is None:
             attn = (input_ids != tokenizer.pad_token_id).long()
         with torch.no_grad():
-            logits = model(input_ids=input_ids, attention_mask=attn).logits
+            outputs = model(input_ids=input_ids, attention_mask=attn)
+        # most HF causal LMs return an object with .logits; some
+        # trust_remote_code models return a tuple/dict. Handle both, or fail
+        # loud rather than AttributeError deep in the stack.
+        if hasattr(outputs, "logits"):
+            logits = outputs.logits
+        elif isinstance(outputs, (tuple, list)):
+            logits = outputs[0]
+        elif isinstance(outputs, dict) and "logits" in outputs:
+            logits = outputs["logits"]
+        else:
+            raise RuntimeError(
+                f"model forward returned {type(outputs)} with no .logits -- cannot "
+                f"compute per-sentence loss. Inspect this model's forward return type.")
         shift_logits = logits[:, :-1, :]          # predict t+1 from t
         shift_labels = input_ids[:, 1:]
         shift_mask = attn[:, 1:].bool()
+        if shift_labels.shape[1] == 0:
+            # whole batch is single-token sentences -> no predictions possible;
+            # all get skipped by the <1-real-token filter below anyway.
+            return {}
         tok_nll = F.cross_entropy(
             shift_logits.reshape(-1, shift_logits.size(-1)),
             shift_labels.reshape(-1), reduction="none",
