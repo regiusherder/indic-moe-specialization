@@ -22,3 +22,6 @@ __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
 .DS_Store
+
+# tokenizer files fetched by verify_tokenization.py
+.tokcheck_cache/

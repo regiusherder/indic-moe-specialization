@@ -1,0 +1,49 @@
+UNK-token audit: does each tokenizer actually tokenize every language,
+or does some script collapse to <unk>?
+
+  fetching https://huggingface.co/allenai/OLMoE-1B-7B-0125/resolve/main/tokenizer.json ...
+=== olmoe (allenai/OLMoE-1B-7B-0125) -- unk_token_id=3938 ===
+  english      19966 tokens,     0 unk (0.0000%)
+  hindi        19888 tokens,     0 unk (0.0000%)
+  marathi      19963 tokens,     0 unk (0.0000%)
+  bengali      19993 tokens,     0 unk (0.0000%)
+  gujarati     19987 tokens,     0 unk (0.0000%)
+  punjabi      19997 tokens,     0 unk (0.0000%)
+  urdu         19935 tokens,     0 unk (0.0000%)
+  tamil        19991 tokens,     0 unk (0.0000%)
+  telugu       19928 tokens,     0 unk (0.0000%)
+  malayalam    19528 tokens,     0 unk (0.0000%)
+  kannada      19761 tokens,     0 unk (0.0000%)
+
+  fetching https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B/resolve/main/tokenizer.json ...
+=== qwen_moe (Qwen/Qwen1.5-MoE-A2.7B) -- unk_token_id=128244 ===
+  english      19967 tokens,     0 unk (0.0000%)
+  hindi        19816 tokens,     0 unk (0.0000%)
+  marathi      19982 tokens,     0 unk (0.0000%)
+  bengali      19969 tokens,     0 unk (0.0000%)
+  gujarati     19904 tokens,     0 unk (0.0000%)
+  punjabi      19913 tokens,     0 unk (0.0000%)
+  urdu         19958 tokens,     0 unk (0.0000%)
+  tamil        19937 tokens,     0 unk (0.0000%)
+  telugu       19860 tokens,     0 unk (0.0000%)
+  malayalam    19884 tokens,     0 unk (0.0000%)
+  kannada      19855 tokens,     0 unk (0.0000%)
+
+  fetching https://huggingface.co/deepseek-ai/deepseek-moe-16b-base/resolve/main/tokenizer.json ...
+=== deepseek_moe (deepseek-ai/deepseek-moe-16b-base) -- unk_token_id=5078 ===
+  english      19973 tokens,     0 unk (0.0000%)
+  hindi        19975 tokens,     0 unk (0.0000%)
+  marathi      19894 tokens,     0 unk (0.0000%)
+  bengali      19778 tokens,     0 unk (0.0000%)
+  gujarati     19994 tokens,     0 unk (0.0000%)
+  punjabi      19971 tokens,     0 unk (0.0000%)
+  urdu         19938 tokens,     0 unk (0.0000%)
+  tamil        19830 tokens,     0 unk (0.0000%)
+  telugu       19957 tokens,     0 unk (0.0000%)
+  malayalam    19731 tokens,     0 unk (0.0000%)
+  kannada      19628 tokens,     0 unk (0.0000%)
+
+============================================================
+PASS: no language shows meaningful UNK -- every script is genuinely
+tokenized into subwords, so routing reflects real processing, not
+the model choking on unknown tokens.
