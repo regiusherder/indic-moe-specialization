@@ -1,0 +1,120 @@
+{
+  "timestamp_utc": "2026-07-04T06:16:28.687388+00:00",
+  "git_commit": "4e7c9b3284075b681c7c15ae2c4defa8297c377f",
+  "git_dirty": false,
+  "python_version": "3.12.3 (main, Aug 14 2025, 17:47:21) [GCC 13.3.0]",
+  "platform": "Linux-6.8.0-117-generic-x86_64-with-glibc2.39",
+  "config_sha256": "9baa31f355df3f68fb4696860a341d04ecbbdd2499276b2c104bb956b89dee3f",
+  "config_file": "/root/indic-moe-specialization/config.yaml",
+  "config_snapshot": {
+    "seed": 42,
+    "models": {
+      "olmoe": {
+        "hf_id": "allenai/OLMoE-1B-7B-0125",
+        "revision": null,
+        "adapter": "olmoe",
+        "quantization": "4bit"
+      },
+      "qwen_moe": {
+        "hf_id": "Qwen/Qwen1.5-MoE-A2.7B",
+        "revision": null,
+        "adapter": "qwen_moe",
+        "quantization": "4bit"
+      },
+      "deepseek_moe": {
+        "hf_id": "deepseek-ai/deepseek-moe-16b-base",
+        "revision": null,
+        "adapter": "deepseek_moe",
+        "quantization": "4bit"
+      }
+    },
+    "languages": {
+      "english": {
+        "code": "eng_Latn",
+        "family": "Indo-European",
+        "script": "Latin"
+      },
+      "hindi": {
+        "code": "hin_Deva",
+        "family": "Indo-Aryan",
+        "script": "Devanagari"
+      },
+      "marathi": {
+        "code": "mar_Deva",
+        "family": "Indo-Aryan",
+        "script": "Devanagari"
+      },
+      "bengali": {
+        "code": "ben_Beng",
+        "family": "Indo-Aryan",
+        "script": "Bengali"
+      },
+      "gujarati": {
+        "code": "guj_Gujr",
+        "family": "Indo-Aryan",
+        "script": "Gujarati"
+      },
+      "punjabi": {
+        "code": "pan_Guru",
+        "family": "Indo-Aryan",
+        "script": "Gurmukhi"
+      },
+      "urdu": {
+        "code": "urd_Arab",
+        "family": "Indo-Aryan",
+        "script": "Perso-Arabic"
+      },
+      "tamil": {
+        "code": "tam_Taml",
+        "family": "Dravidian",
+        "script": "Tamil"
+      },
+      "telugu": {
+        "code": "tel_Telu",
+        "family": "Dravidian",
+        "script": "Telugu"
+      },
+      "malayalam": {
+        "code": "mal_Mlym",
+        "family": "Dravidian",
+        "script": "Malayalam"
+      },
+      "kannada": {
+        "code": "kan_Knda",
+        "family": "Dravidian",
+        "script": "Kannada"
+      }
+    },
+    "data": {
+      "flores_url": "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz",
+      "flores_sha256": null,
+      "split": "devtest",
+      "max_tokens_per_language": 20000,
+      "max_sentences_pool": 1012
+    },
+    "routing": {
+      "permutation_test": {
+        "n_permutations": 1000,
+        "alpha": 0.001
+      },
+      "bootstrap": {
+        "n_resamples": 200
+      }
+    },
+    "ablation": {
+      "top_n_experts": 8,
+      "n_random_controls": 10,
+      "perplexity_max_tokens": 2000
+    },
+    "output": {
+      "results_dir": "results",
+      "checkpoint_after_each": true
+    }
+  },
+  "torch_version": "2.8.0+cu128",
+  "cuda_available": true,
+  "gpu_name": "NVIDIA RTX PRO 4500 Blackwell",
+  "gpu_count": 1,
+  "model_key": "qwen_moe",
+  "flores_sha256": "b8b0b76783024b85797e5cc75064eb83fc5288b41e9654dabc7be6ae944011f6"
+}

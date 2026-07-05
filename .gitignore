@@ -1,6 +1,24 @@
-results/
+# Local-only working files
+# (comments must be on their own line — inline comments become part of the pattern)
+
+# internal teaching doc, kept out of the public repo
+WALKTHROUGH.md
+
+# raw transfer off the GPU pod (large; not the published copy)
+results-from-runpod/
+
+# downloaded model weights (~75GB)
 .hf_cache/
+
+# Published results: keep figures + small analysis outputs, drop heavy raw routing pickles.
+# Per-sentence routing pickles are multi-GB and regenerable by running the pipeline.
+results/**/02_routing_raw/
+*.pkl
+
+# Python / env cruft
 __pycache__/
 *.pyc
 .venv/
 *.egg-info/
+.ipynb_checkpoints/
+.DS_Store
