@@ -11,6 +11,7 @@ Exit code is non-zero if ANY model failed, so calling infrastructure
 (GitHub Actions, a shell script's `set -e`, cron) can still detect partial failure
 even though the run continues.
 """
+import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -19,13 +20,19 @@ MODELS = ["olmoe", "qwen_moe", "deepseek_moe"]
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--phase", default="full", choices=["extract", "ablate", "full"],
+                        help="GPU phase to run for every model (passed to run_model.py).")
+    args = parser.parse_args()
+
     script_dir = Path(__file__).resolve().parent
     failures = []
 
     for model in MODELS:
-        print(f"\n{'#'*70}\n# Starting {model}\n{'#'*70}")
+        print(f"\n{'#'*70}\n# Starting {model} (phase={args.phase})\n{'#'*70}")
         result = subprocess.run(
-            [sys.executable, str(script_dir / "run_model.py"), "--model", model],
+            [sys.executable, str(script_dir / "run_model.py"),
+             "--model", model, "--phase", args.phase],
             cwd=script_dir.parent,
         )
         if result.returncode != 0:

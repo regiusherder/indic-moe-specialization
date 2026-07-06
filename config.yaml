@@ -86,6 +86,20 @@ routing:
   bootstrap:
     n_resamples: 200      # sentence-level bootstrap for CIs on JSD estimates
 
+analysis:
+  # The stage-4 analysis (per-layer JSD + permutation + bootstrap) is pure-CPU
+  # stats over the routing .pkl files -- no model, no GPU. It is run OFF the GPU:
+  # the GPU pod does extraction (run_all.sh, phase=extract), you pull results/
+  # to a laptop and run analyse_all.sh (which calls scripts/run_analysis.py),
+  # then sync back and the pod does ablation (run_all.sh, phase=ablate).
+  #
+  # n_workers: layers are statistically independent, so the stage fans out across
+  #   CPU cores, one task per layer (src/analysis.py). null -> a SAFE laptop
+  #   default (min(4, cpu_count-1)); each worker holds a full copy of the records
+  #   so going one-per-layer can exhaust RAM on a 16GB machine. Override on the
+  #   command line: analyse_all.sh --workers N.  Only used by the analysis stage.
+  n_workers: null
+
 ablation:
   # top_n_experts is now a SWEEP (critique #17): report the causal effect at
   # several ablation sizes so the conclusion doesn't hinge on one unmotivated k.

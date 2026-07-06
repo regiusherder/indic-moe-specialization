@@ -1,351 +1,429 @@
 #!/usr/bin/env python
 """Analyze the study's results/ folder into figures + a text summary of the
-key findings. Reads only the artifacts run_all.sh produces — no GPU, no
-models, runs on a laptop in seconds.
+key findings. Reads only the artifacts run_all.sh / analyse_all.sh produce --
+no GPU, no models, runs on a laptop in seconds.
 
 Usage:
     python scripts/analyze_results.py --results ./results-from-runpod --out ./figures
 
-Produces, per model (olmoe / qwen_moe / deepseek_moe):
-  - jsd_heatmap_{model}.png      mean-across-layers JSD matrix, family-ordered
-  - dendrogram_{model}.png       hierarchical clustering of languages by routing
-  - layerwise_{model}.png        JSD vs English, per language, across depth
-And across all models:
-  - hindi_urdu_control.png       the key script-vs-family test
-  - ablation_{model}.png         targeted vs random-control loss deltas by family
-  - findings_summary.txt         the numbers, in plain text, for the write-up
+Tree layout: results/<condition>/seed<seed>/<model>/{03_analysis,04_ablation}/...
+where condition in {token_capped, aligned} and there are 2 seeds per condition.
+The whole point of running both conditions and both seeds is that the
+headline findings should SURVIVE all four (condition, seed) combinations per
+model -- so every figure/number here is reported per condition, aggregated
+across seeds (mean + spread), rather than silently picking one cell.
+
+Produces, per (model, condition):
+  - jsd_heatmap_{model}_{condition}.png   mean-across-layers-and-seeds JSD matrix
+  - dendrogram_{model}_{condition}.png    hierarchical clustering of languages
+  - layerwise_{model}_{condition}.png     JSD vs English, per language, by depth
+And across all models/conditions:
+  - script_pair_controls.png   Hindi-Urdu AND Kashmiri-Deva/Arab, both conditions
+  - ablation_{model}_{condition}_topn{N}.png   targeted vs random deltas by family
+  - findings_summary.txt       the numbers, in plain text, for the write-up
 """
 import argparse
-import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# headless backend so this runs anywhere
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.cluster.hierarchy import dendrogram, linkage
 from scipy.spatial.distance import squareform
 
-MODELS = ["olmoe", "qwen_moe", "deepseek_moe"]
-
-# linguistic metadata (mirrors config.yaml) for grouping/interpretation
-FAMILY = {
-    "english": "Indo-European",
-    "hindi": "Indo-Aryan", "marathi": "Indo-Aryan", "bengali": "Indo-Aryan",
-    "gujarati": "Indo-Aryan", "punjabi": "Indo-Aryan", "urdu": "Indo-Aryan",
-    "tamil": "Dravidian", "telugu": "Dravidian", "malayalam": "Dravidian", "kannada": "Dravidian",
-}
-SCRIPT = {
-    "english": "Latin", "hindi": "Devanagari", "marathi": "Devanagari",
-    "bengali": "Bengali", "gujarati": "Gujarati", "punjabi": "Gurmukhi",
-    "urdu": "Perso-Arabic", "tamil": "Tamil", "telugu": "Telugu",
-    "malayalam": "Malayalam", "kannada": "Kannada",
-}
-# family-then-name display order for readable heatmaps
-ORDER = ["english",
-         "hindi", "marathi", "bengali", "gujarati", "punjabi", "urdu",
-         "tamil", "telugu", "malayalam", "kannada"]
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.results_io import (cell_has_ablation, cell_has_analysis, discover_matrix,
+                            find_cells, language_metadata, load_ablation, load_config,
+                            load_jsd, load_permutation_tests, mean_jsd_across_layers,
+                            reorder_matrix, script_pairs, seed_aggregate)
 
 
-def load_jsd(results: Path, model: str):
-    data = json.loads((results / model / "03_analysis" / "jsd_by_layer.json").read_text(encoding="utf-8"))
-    # keys are stringified layer indices
-    layers = sorted(data.keys(), key=lambda k: int(k))
-    lang_order = data[layers[0]]["lang_order"]
-    n_layers = len(layers)
-    n = len(lang_order)
-    hard = np.zeros((n_layers, n, n))
-    soft = np.zeros((n_layers, n, n))
-    for li, lk in enumerate(layers):
-        hard[li] = np.array(data[lk]["matrix_hard"])
-        soft[li] = np.array(data[lk]["matrix_soft"])
-    return lang_order, hard, soft, [int(x) for x in layers]
+def display_order(lang_meta):
+    """English first, then Indo-Aryan (Devanagari, then other scripts), then
+    Dravidian -- mirrors config.yaml's grouping for readable figures."""
+    fam_rank = {"Indo-European": 0, "Indo-Aryan": 1, "Dravidian": 2}
+    script_rank = {"Devanagari": 0}
+    return sorted(lang_meta.keys(),
+                 key=lambda l: (fam_rank.get(lang_meta[l]["family"], 9),
+                                script_rank.get(lang_meta[l]["script"], 1), l))
 
 
-def reorder(mat, lang_order, target=ORDER):
-    target = [l for l in target if l in lang_order]
-    idx = [lang_order.index(l) for l in target]
-    return mat[np.ix_(idx, idx)], target
+def load_cell_mean_jsd(cell_dir):
+    lang_order, hard, soft, layers = load_jsd(cell_dir)
+    mean_hard, mean_soft = mean_jsd_across_layers(hard, soft)
+    return lang_order, mean_hard, mean_soft, hard, layers
 
 
-def fig_heatmap(mean_jsd, lang_order, model, out: Path):
-    m, names = reorder(mean_jsd, lang_order)
-    fig, ax = plt.subplots(figsize=(10, 8.5))
+def aggregate_condition_jsd(results_root, model, condition, seeds):
+    """Mean + per-seed spread of the (already layer-averaged) hard JSD matrix
+    across the seeds available for (model, condition). Returns
+    (lang_order, mean_mat, spread_mat, per_seed_layerwise_hard, layers) or None
+    if no cell for this (model, condition) has valid analysis."""
+    per_seed_mean, per_seed_hard, lang_order, layers = {}, {}, None, None
+    for seed in seeds:
+        cells = find_cells(results_root, model=model, condition=condition, seed=seed)
+        for _, _, _, cell_dir in cells:
+            if not cell_has_analysis(cell_dir):
+                continue
+            lo, mean_hard, mean_soft, hard, ly = load_cell_mean_jsd(cell_dir)
+            if lang_order is None:
+                lang_order, layers = lo, ly
+            elif lo != lang_order:
+                raise ValueError(f"{cell_dir}: lang_order differs from other seeds for "
+                                 f"{model}/{condition} -- cannot aggregate across seeds.")
+            per_seed_mean[seed] = mean_hard
+            per_seed_hard[seed] = hard
+    if not per_seed_mean:
+        return None
+    mean_mat, spread_mat = seed_aggregate(per_seed_mean)
+    return lang_order, mean_mat, spread_mat, per_seed_hard, layers
+
+
+def fig_heatmap(mean_jsd, lang_order, model, condition, order, out: Path):
+    m, names = reorder_matrix(mean_jsd, lang_order, order)
+    fig, ax = plt.subplots(figsize=(11, 9.5))
     im = ax.imshow(m, cmap="viridis")
-    ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=45, ha="right", fontsize=10)
-    ax.set_yticks(range(len(names))); ax.set_yticklabels(names, fontsize=10)
+    ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=45, ha="right", fontsize=9)
+    ax.set_yticks(range(len(names))); ax.set_yticklabels(names, fontsize=9)
     for i in range(len(names)):
         for j in range(len(names)):
             ax.text(j, i, f"{m[i,j]:.3f}", ha="center", va="center",
-                    color="white" if m[i, j] < m.max() * 0.6 else "black", fontsize=8)
-    fig.colorbar(im, ax=ax, label="mean JSD across layers")
-    ax.set_title(f"{model}: routing-distribution JSD between languages\n(hard top-k, averaged over layers)")
+                    color="white" if m[i, j] < m.max() * 0.6 else "black", fontsize=6.5)
+    fig.colorbar(im, ax=ax, label="mean JSD across layers + seeds")
+    ax.set_title(f"{model} [{condition}]: routing-distribution JSD between languages\n"
+                f"(hard top-k, averaged over layers and seeds)")
     fig.tight_layout()
-    fig.savefig(out / f"jsd_heatmap_{model}.png", dpi=600, bbox_inches="tight")
+    fig.savefig(out / f"jsd_heatmap_{model}_{condition}.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
-def fig_dendrogram(mean_jsd, lang_order, model, out: Path):
-    m, names = reorder(mean_jsd, lang_order)
-    # force exact symmetry + zero diagonal, then convert the square (n x n)
-    # distance matrix to condensed form. squareform infers direction from
-    # input shape: a 2-D square array -> condensed vector, which is what we
-    # want. Tiny float asymmetries otherwise trip checks; we pass checks=False
-    # after symmetrizing ourselves.
+def fig_dendrogram(mean_jsd, lang_order, model, condition, order, out: Path):
+    m, names = reorder_matrix(mean_jsd, lang_order, order)
+    if len(names) < 3:
+        return
     m = np.asarray(m, dtype=float)
     m = (m + m.T) / 2.0
     np.fill_diagonal(m, 0.0)
-    condensed = squareform(m, checks=False)  # (n,n) square -> length n*(n-1)/2 vector
+    condensed = squareform(m, checks=False)
     Z = linkage(condensed, method="average")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    dendrogram(Z, labels=names, ax=ax, leaf_rotation=45, leaf_font_size=11)
+    fig, ax = plt.subplots(figsize=(13, 6))
+    dendrogram(Z, labels=names, ax=ax, leaf_rotation=45, leaf_font_size=10)
     ax.set_ylabel("JSD (average linkage)")
-    ax.set_title(f"{model}: language clustering by routing similarity\n"
-                 f"(Dravidian vs Indo-Aryan; does Urdu sit with Hindi or apart?)")
-    fig.subplots_adjust(bottom=0.18)  # room for rotated labels
+    ax.set_title(f"{model} [{condition}]: language clustering by routing similarity")
+    fig.subplots_adjust(bottom=0.2)
     fig.tight_layout()
-    fig.savefig(out / f"dendrogram_{model}.png", dpi=600, bbox_inches="tight")
+    fig.savefig(out / f"dendrogram_{model}_{condition}.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
-def fig_layerwise(hard, lang_order, layers, model, out: Path):
+def fig_layerwise(per_seed_hard, lang_order, layers, model, condition, lang_meta, order, out: Path):
     if "english" not in lang_order:
         return
     eng = lang_order.index("english")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    for lang in ORDER:
+    # average layerwise curves across seeds
+    stacked = np.stack(list(per_seed_hard.values()), axis=0)  # (seed, layer, n, n)
+    mean_by_layer = stacked.mean(axis=0)  # (layer, n, n)
+    fig, ax = plt.subplots(figsize=(12, 6.5))
+    fam_color = {"Indo-Aryan": "tab:blue", "Dravidian": "tab:red", "Indo-European": "tab:gray"}
+    for lang in order:
         if lang not in lang_order or lang == "english":
             continue
         i = lang_order.index(lang)
-        color = {"Indo-Aryan": "tab:blue", "Dravidian": "tab:red"}.get(FAMILY[lang], "gray")
-        ax.plot(layers, hard[:, eng, i], marker="o", ms=3, color=color, alpha=0.75, label=lang)
-    ax.set_xlabel("layer"); ax.set_ylabel("JSD vs English")
-    ax.set_title(f"{model}: layer-wise routing divergence from English\n(blue=Indo-Aryan, red=Dravidian)")
-    # legend outside the plot area so it never overlaps the lines
-    ax.legend(fontsize=9, ncol=1, loc="center left", bbox_to_anchor=(1.01, 0.5))
+        color = fam_color.get(lang_meta[lang]["family"], "gray")
+        ax.plot(layers, mean_by_layer[:, eng, i], marker="o", ms=3, color=color, alpha=0.75, label=lang)
+    ax.set_xlabel("layer"); ax.set_ylabel("JSD vs English (mean across seeds)")
+    ax.set_title(f"{model} [{condition}]: layer-wise routing divergence from English\n"
+                f"(blue=Indo-Aryan, red=Dravidian)")
+    ax.legend(fontsize=8, ncol=1, loc="center left", bbox_to_anchor=(1.01, 0.5))
     fig.tight_layout()
-    fig.savefig(out / f"layerwise_{model}.png", dpi=600, bbox_inches="tight")
+    fig.savefig(out / f"layerwise_{model}_{condition}.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
-def hindi_urdu_analysis(results: Path, summary: list):
-    """The headline control: Hindi-Urdu (same language, different script) vs
-    Hindi to its other Indo-Aryan relatives (different script AND some
-    linguistic distance). Low Hindi-Urdu relative to the others => routing
-    tracks language identity, not script."""
-    summary.append("=" * 70)
-    summary.append("HINDI-URDU CONTROL (script vs. language-identity)")
-    summary.append("=" * 70)
+def script_pair_analysis(results_root, models, conditions, seeds, lang_meta, pairs, summary: list):
+    """Generalized script-vs-language-identity control for EVERY pair_id in
+    config.yaml (currently hindustani=hindi/urdu, kashmiri=kashmiri_deva/arab),
+    reported per (model, condition), aggregated across seeds. Low same-pair JSD
+    relative to the language's other same-family relatives => routing tracks
+    language identity, not script."""
+    summary.append("=" * 78)
+    summary.append("SCRIPT-vs-LANGUAGE-IDENTITY CONTROLS (all script-pairs in config.yaml)")
+    summary.append("=" * 78)
     rows = []
-    for model in MODELS:
-        lang_order, hard, soft, layers = load_jsd(results, model)
-        mean = hard.mean(axis=0)
-        def jsd_between(a, b):
-            return mean[lang_order.index(a), lang_order.index(b)]
-        hu = jsd_between("hindi", "urdu")
-        others = [("hindi", x) for x in ["marathi", "bengali", "gujarati", "punjabi"] if x in lang_order]
-        other_vals = [jsd_between(a, b) for a, b in others]
-        rows.append({"model": model, "hindi_urdu": hu,
-                     "hindi_other_IA_mean": np.mean(other_vals),
-                     "ratio": hu / np.mean(other_vals)})
-        summary.append(f"\n{model}:")
-        summary.append(f"  Hindi-Urdu JSD (same lang, diff script): {hu:.4f}")
-        summary.append(f"  Hindi vs other Indo-Aryan (mean):        {np.mean(other_vals):.4f}")
-        for (a, b), v in zip(others, other_vals):
-            summary.append(f"    {a}-{b}: {v:.4f}")
-        verdict = ("language identity > script" if hu < np.mean(other_vals)
-                   else "script effects dominant")
-        summary.append(f"  -> {verdict} (ratio {hu/np.mean(other_vals):.2f})")
+    for model in models:
+        for condition in conditions:
+            agg = aggregate_condition_jsd(results_root, model, condition, seeds)
+            if agg is None:
+                continue
+            lang_order, mean_mat, spread_mat, _, _ = agg
+            for pair_id, (a, b) in [(pid, langs) for pid, langs in pairs.items() if len(langs) == 2]:
+                if a not in lang_order or b not in lang_order:
+                    continue
+                pair_jsd = mean_mat[lang_order.index(a), lang_order.index(b)]
+                fam = lang_meta[a]["family"]
+                relatives = [l for l in lang_order if l not in (a, b)
+                            and lang_meta[l]["family"] == fam and lang_meta[l].get("pair_id") != lang_meta[a].get("pair_id")]
+                if not relatives:
+                    continue
+                other_vals = [mean_mat[lang_order.index(a), lang_order.index(r)] for r in relatives]
+                ratio = pair_jsd / np.mean(other_vals) if np.mean(other_vals) > 0 else float("nan")
+                rows.append({"model": model, "condition": condition, "pair_id": pair_id,
+                            "lang_a": a, "lang_b": b, "pair_jsd": pair_jsd,
+                            "other_mean": np.mean(other_vals), "ratio": ratio})
+                summary.append(f"\n{model} [{condition}] {pair_id} ({a}-{b}, same language/diff script):")
+                summary.append(f"  {a}-{b} JSD (same lang, diff script):      {pair_jsd:.4f}")
+                summary.append(f"  {a} vs other {fam} relatives (mean, n={len(relatives)}): {np.mean(other_vals):.4f}")
+                verdict = "language identity > script" if pair_jsd < np.mean(other_vals) else "script effects dominant"
+                summary.append(f"  -> {verdict} (ratio {ratio:.2f})")
     return pd.DataFrame(rows)
 
 
-def fig_hindi_urdu(df, out: Path):
-    fig, ax = plt.subplots(figsize=(8, 5))
-    x = np.arange(len(df))
-    w = 0.38
-    ax.bar(x - w/2, df["hindi_urdu"], w, label="Hindi-Urdu (same lang, diff script)", color="tab:green")
-    ax.bar(x + w/2, df["hindi_other_IA_mean"], w, label="Hindi vs other Indo-Aryan (mean)", color="tab:gray")
-    ax.set_xticks(x); ax.set_xticklabels(df["model"])
-    ax.set_ylabel("mean JSD across layers")
-    ax.set_title("Hindi-Urdu control across architectures\n"
-                 "(Hindi-Urdu lower => routing tracks language, not script)")
-    ax.legend(fontsize=8)
+def fig_script_pair_controls(df, out: Path):
+    if df.empty:
+        return
+    pair_ids = sorted(df["pair_id"].unique())
+    fig, axes = plt.subplots(1, len(pair_ids), figsize=(6.5 * len(pair_ids), 5), squeeze=False)
+    axes = axes[0]
+    for ax, pair_id in zip(axes, pair_ids):
+        sub = df[df["pair_id"] == pair_id]
+        labels = [f"{m}\n{c}" for m, c in zip(sub["model"], sub["condition"])]
+        x = np.arange(len(sub))
+        w = 0.38
+        ax.bar(x - w/2, sub["pair_jsd"], w, label="same lang, diff script", color="tab:green")
+        ax.bar(x + w/2, sub["other_mean"], w, label="vs other same-family langs", color="tab:gray")
+        ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=7)
+        ax.set_ylabel("mean JSD (layers + seeds)")
+        ax.set_title(f"{pair_id}: {sub.iloc[0]['lang_a']}-{sub.iloc[0]['lang_b']}")
+        ax.legend(fontsize=7)
+    fig.suptitle("Script-vs-language-identity controls across models/conditions\n"
+                "(lower green bar => routing tracks language, not script)")
     fig.tight_layout()
-    fig.savefig(out / "hindi_urdu_control.png", dpi=600, bbox_inches="tight")
+    fig.savefig(out / "script_pair_controls.png", dpi=600, bbox_inches="tight")
     plt.close(fig)
 
 
-def family_clustering_score(results: Path, summary: list):
-    """Quantify how well routing separates Dravidian from Indo-Aryan: mean
-    within-family JSD vs mean cross-family JSD. Ratio << 1 => strong
-    family-structured routing."""
-    summary.append("\n" + "=" * 70)
+def family_clustering_score(results_root, models, conditions, seeds, lang_meta, summary: list):
+    summary.append("\n" + "=" * 78)
     summary.append("LANGUAGE-FAMILY SEPARATION (within vs cross-family routing JSD)")
-    summary.append("=" * 70)
-    for model in MODELS:
-        lang_order, hard, soft, layers = load_jsd(results, model)
-        mean = hard.mean(axis=0)
-        indic = [l for l in lang_order if l != "english"]
-        within, cross = [], []
-        for i, a in enumerate(indic):
-            for b in indic[i+1:]:
-                v = mean[lang_order.index(a), lang_order.index(b)]
-                (within if FAMILY[a] == FAMILY[b] else cross).append(v)
-        summary.append(f"\n{model}:")
-        summary.append(f"  within-family mean JSD: {np.mean(within):.4f}")
-        summary.append(f"  cross-family mean JSD:  {np.mean(cross):.4f}")
-        summary.append(f"  ratio (within/cross):   {np.mean(within)/np.mean(cross):.3f}"
-                       f"  ({'family-structured' if np.mean(within) < np.mean(cross) else 'no family structure'})")
+    summary.append("=" * 78)
+    for model in models:
+        for condition in conditions:
+            agg = aggregate_condition_jsd(results_root, model, condition, seeds)
+            if agg is None:
+                continue
+            lang_order, mean_mat, spread_mat, _, _ = agg
+            indic = [l for l in lang_order if lang_meta[l]["family"] != "Indo-European"]
+            within, cross = [], []
+            for i, a in enumerate(indic):
+                for b in indic[i+1:]:
+                    v = mean_mat[lang_order.index(a), lang_order.index(b)]
+                    (within if lang_meta[a]["family"] == lang_meta[b]["family"] else cross).append(v)
+            if not within or not cross:
+                continue
+            ratio = np.mean(within) / np.mean(cross)
+            summary.append(f"\n{model} [{condition}]:")
+            summary.append(f"  within-family mean JSD: {np.mean(within):.4f}")
+            summary.append(f"  cross-family mean JSD:  {np.mean(cross):.4f}")
+            summary.append(f"  ratio (within/cross):   {ratio:.3f}  "
+                          f"({'family-structured' if ratio < 1 else 'no family structure'})")
 
 
-def ablation_analysis(results: Path, summary: list, out: Path):
-    """Targeted (family-preferring experts ablated) vs random-control ablation.
-
-    IMPORTANT correction (2026-07-05): Test A originally compared each family's
-    targeted-ablation delta against a single POOLED random-control baseline
-    (averaged across ALL languages, including English). That's an
-    apples-to-oranges comparison: different languages have very different
-    baseline sensitivity to ANY ablation (observed range 0.16-0.57 loss delta
-    across languages, just from random experts) — English in particular has a
-    much lower random-control baseline than the Indic languages, which can
-    make a family's targeted effect look "specific" purely because the pooled
-    baseline undershoots what that family would show even under RANDOM
-    ablation. Test A now compares against the random-control baseline
-    restricted to the SAME family's languages, which is the correct
-    apples-to-apples comparison.
-
-    Test B (own family vs the OTHER Indic family, both under the SAME
-    targeted-ablation condition) was always apples-to-apples and needed no
-    correction — it remains the stronger, cleaner specificity test.
-    """
-    summary.append("\n" + "=" * 70)
+def ablation_analysis(results_root, models, conditions, seeds, lang_meta, summary: list, out: Path):
+    """Per (model, condition, top_n): targeted vs random-control ablation deltas
+    by family, aggregated (mean) across seeds and across trials. `delta_mean` is
+    ALREADY the per-sentence loss delta vs that language's own baseline (see
+    src/results_io.py docstring) -- there is no separate baseline row/column to
+    subtract."""
+    summary.append("\n" + "=" * 78)
     summary.append("CAUSAL ABLATION (targeted family experts vs random controls)")
-    summary.append("=" * 70)
-    for model in MODELS:
-        df = pd.read_csv(results / model / "04_ablation" / "ablation_results.csv")
-        summary.append(f"\n{model}:")
-        rand_df = df[df["condition"] == "random_control"]
-        targeted = df[df["condition"] == "targeted"]
-        groups = sorted(targeted["group"].dropna().unique())
-        fig, ax = plt.subplots(figsize=(9, 5))
-        width = 0.8 / max(len(groups), 1)
-        fams = ["Indo-Aryan", "Dravidian", "Indo-European"]
-        xpos = np.arange(len(fams))
-        for gi, group in enumerate(groups):
-            deltas = []
-            for fam in fams:
-                sub = targeted[(targeted["group"] == group) & (targeted["family"] == fam)]
-                deltas.append(sub["delta_vs_baseline"].mean() if len(sub) else 0.0)
-            ax.bar(xpos + gi * width, deltas, width, label=f"ablate {group} experts")
+    summary.append("=" * 78)
+    all_families = sorted({m["family"] for m in lang_meta.values()})
+    for model in models:
+        for condition in conditions:
+            dfs = []
+            for seed in seeds:
+                for _, _, _, cell_dir in find_cells(results_root, model=model, condition=condition, seed=seed):
+                    if cell_has_ablation(cell_dir):
+                        d = load_ablation(cell_dir)
+                        d["seed"] = seed
+                        dfs.append(d)
+            if not dfs:
+                continue
+            df = pd.concat(dfs, ignore_index=True)
+            for top_n in sorted(df["top_n"].unique()):
+                tdf = df[df["top_n"] == top_n]
+                summary.append(f"\n{model} [{condition}] top_n={top_n} (n_seeds={tdf['seed'].nunique()}):")
+                rand_df = tdf[tdf["condition"] == "random_control"]
+                targeted = tdf[tdf["condition"] == "targeted"]
+                groups = sorted(targeted["group"].dropna().unique())
+                if not groups:
+                    continue
+                fams = [f for f in all_families if f in tdf["family"].unique()]
+                fig, ax = plt.subplots(figsize=(9, 5))
+                width = 0.8 / max(len(groups), 1)
+                xpos = np.arange(len(fams))
+                for gi, group in enumerate(groups):
+                    deltas = [targeted[(targeted["group"] == group) & (targeted["family"] == fam)]["delta_mean"].mean()
+                             if len(targeted[(targeted["group"] == group) & (targeted["family"] == fam)]) else 0.0
+                             for fam in fams]
+                    ax.bar(xpos + gi * width, deltas, width, label=f"ablate {group} experts")
 
-            # Test A (corrected): own-family targeted delta vs the random-control
-            # baseline computed ONLY over that same family's languages (not
-            # pooled across all languages, which biases the comparison).
-            own = targeted[(targeted["group"] == group) & (targeted["family"] == group)]["delta_vs_baseline"].mean()
-            rand_same_fam = rand_df[rand_df["family"] == group]["delta_vs_baseline"].mean()
-            summary.append(f"  ablating {group}-preferring experts -> mean delta on {group} langs: "
-                           f"{own:.4f} (random baseline, {group} languages only: {rand_same_fam:.4f}; "
-                           f"{'SPECIFIC vs random' if own > rand_same_fam else 'NOT above random'})")
-            # Test B (own family vs the OTHER Indic family, same condition — no
-            # baseline-choice ambiguity, the cleanest test we have).
-            if group in ("Indo-Aryan", "Dravidian"):
-                other_fam = "Dravidian" if group == "Indo-Aryan" else "Indo-Aryan"
-                on_other = targeted[(targeted["group"] == group) & (targeted["family"] == other_fam)]["delta_vs_baseline"].mean()
-                diff = own - on_other
-                summary.append(f"      vs other family ({other_fam}): {on_other:.4f}  "
-                               f"differential={diff:+.4f} "
-                               f"({'family-specific' if diff > 0 else 'NOT family-specific'})")
-        # per-family random-control baseline markers (not one pooled line —
-        # different families have different baseline sensitivity to ANY
-        # ablation, so a single pooled reference line would be misleading here)
-        for fi, fam in enumerate(fams):
-            rand_fam = rand_df[rand_df["family"] == fam]["delta_vs_baseline"].mean()
-            ax.plot([fi - 0.4, fi + 0.4], [rand_fam, rand_fam], "k--", lw=1.2,
-                    label="random-control (per family)" if fi == 0 else None)
-        ax.set_xticks(xpos + width * (len(groups)-1) / 2)
-        ax.set_xticklabels(fams)
-        ax.set_ylabel("mean loss increase vs baseline")
-        ax.set_title(f"{model}: expert-ablation loss deltas by language family")
-        ax.legend(fontsize=7)
-        fig.tight_layout()
-        fig.savefig(out / f"ablation_{model}.png", dpi=600, bbox_inches="tight")
-        plt.close(fig)
+                    own = targeted[(targeted["group"] == group) & (targeted["family"] == group)]["delta_mean"].mean()
+                    rand_same_fam = rand_df[rand_df["family"] == group]["delta_mean"].mean()
+                    if pd.notna(own) and pd.notna(rand_same_fam):
+                        summary.append(f"  ablating {group}-preferring experts -> mean delta on {group} langs: "
+                                      f"{own:.4f} (random baseline, {group} languages only: {rand_same_fam:.4f}; "
+                                      f"{'SPECIFIC vs random' if own > rand_same_fam else 'NOT above random'})")
+                    other_fams = [f for f in fams if f != group and f in ("Indo-Aryan", "Dravidian")]
+                    for other_fam in other_fams:
+                        on_other = targeted[(targeted["group"] == group) & (targeted["family"] == other_fam)]["delta_mean"].mean()
+                        if pd.notna(own) and pd.notna(on_other):
+                            diff = own - on_other
+                            summary.append(f"      vs {other_fam}: {on_other:.4f}  differential={diff:+.4f} "
+                                          f"({'family-specific' if diff > 0 else 'NOT family-specific'})")
+                for fi, fam in enumerate(fams):
+                    rand_fam = rand_df[rand_df["family"] == fam]["delta_mean"].mean()
+                    if pd.notna(rand_fam):
+                        ax.plot([fi - 0.4, fi + 0.4], [rand_fam, rand_fam], "k--", lw=1.2,
+                               label="random-control (per family)" if fi == 0 else None)
+                ax.set_xticks(xpos + width * (len(groups)-1) / 2)
+                ax.set_xticklabels(fams)
+                ax.set_ylabel("mean loss increase vs baseline")
+                ax.set_title(f"{model} [{condition}] top_n={top_n}: ablation loss deltas by family\n(mean across {tdf['seed'].nunique()} seed(s))")
+                ax.legend(fontsize=7)
+                fig.tight_layout()
+                fig.savefig(out / f"ablation_{model}_{condition}_topn{top_n}.png", dpi=600, bbox_inches="tight")
+                plt.close(fig)
 
 
-def significance_summary(results: Path, summary: list):
-    """Fraction of language pairs significant under the PRIMARY (sentence-level)
-    permutation test, per model."""
-    summary.append("\n" + "=" * 70)
+def significance_summary(results_root, models, conditions, seeds, summary: list):
+    summary.append("\n" + "=" * 78)
     summary.append("PERMUTATION SIGNIFICANCE (sentence-level = primary)")
-    summary.append("=" * 70)
-    for model in MODELS:
-        df = pd.read_csv(results / model / "03_analysis" / "permutation_tests.csv")
-        sent = df[df["unit"] == "sentence"]
-        # collapse to one row per language pair: significant if significant at ANY layer
-        # (and also report the stricter all-layers view)
-        alpha = 0.05
-        pairs = sent.groupby(["lang_a", "lang_b"])
-        any_sig = pairs["p_value"].min().lt(alpha).mean()
-        all_sig = pairs["p_value"].max().lt(alpha).mean()
-        med_eff = sent["effect_size_sd"].median()
-        summary.append(f"\n{model}:")
-        summary.append(f"  pairs significant (p<{alpha}) at >=1 layer: {any_sig*100:.0f}%")
-        summary.append(f"  pairs significant (p<{alpha}) at ALL layers: {all_sig*100:.0f}%")
-        summary.append(f"  median effect size (sentence-level): {med_eff:.1f} SD above null")
+    summary.append("=" * 78)
+    for model in models:
+        for condition in conditions:
+            dfs = []
+            for seed in seeds:
+                for _, _, _, cell_dir in find_cells(results_root, model=model, condition=condition, seed=seed):
+                    if cell_has_analysis(cell_dir):
+                        d = load_permutation_tests(cell_dir)
+                        d["seed"] = seed
+                        dfs.append(d)
+            if not dfs:
+                continue
+            df = pd.concat(dfs, ignore_index=True)
+            sent = df[df["unit"] == "sentence"]
+            alpha = 0.05
+            # aggregate per (lang_a, lang_b, seed) first (min/max p across layers),
+            # then average the resulting fraction across seeds
+            per_seed_fracs_any, per_seed_fracs_all = [], []
+            for seed in sent["seed"].unique():
+                s = sent[sent["seed"] == seed]
+                pairs = s.groupby(["lang_a", "lang_b"])
+                per_seed_fracs_any.append(pairs["p_value"].min().lt(alpha).mean())
+                per_seed_fracs_all.append(pairs["p_value"].max().lt(alpha).mean())
+            med_eff = sent["effect_size_sd"].median()
+            summary.append(f"\n{model} [{condition}] (n_seeds={sent['seed'].nunique()}):")
+            summary.append(f"  pairs significant (p<{alpha}) at >=1 layer: "
+                          f"{np.mean(per_seed_fracs_any)*100:.0f}% (per-seed: "
+                          f"{', '.join(f'{v*100:.0f}%' for v in per_seed_fracs_any)})")
+            summary.append(f"  pairs significant (p<{alpha}) at ALL layers: {np.mean(per_seed_fracs_all)*100:.0f}%")
+            summary.append(f"  median effect size (sentence-level): {med_eff:.1f} SD above null")
+
+
+def condition_agreement_summary(results_root, models, conditions, seeds, lang_meta, summary: list):
+    """Does the family-separation finding survive BOTH sampling conditions? This
+    is the direct answer to the confound pair the two conditions exist to
+    control (content-vs-precision, critiques #5/#6) -- if the ratio only shows
+    up under one condition, that's the headline result of this whole rerun."""
+    summary.append("\n" + "=" * 78)
+    summary.append("CROSS-CONDITION AGREEMENT (does family structure survive BOTH conditions?)")
+    summary.append("=" * 78)
+    for model in models:
+        ratios = {}
+        for condition in conditions:
+            agg = aggregate_condition_jsd(results_root, model, condition, seeds)
+            if agg is None:
+                continue
+            lang_order, mean_mat, _, _, _ = agg
+            indic = [l for l in lang_order if lang_meta[l]["family"] != "Indo-European"]
+            within, cross = [], []
+            for i, a in enumerate(indic):
+                for b in indic[i+1:]:
+                    v = mean_mat[lang_order.index(a), lang_order.index(b)]
+                    (within if lang_meta[a]["family"] == lang_meta[b]["family"] else cross).append(v)
+            if within and cross:
+                ratios[condition] = np.mean(within) / np.mean(cross)
+        if len(ratios) < 2:
+            summary.append(f"\n{model}: only {len(ratios)}/{len(conditions)} condition(s) available — "
+                          f"cannot assess cross-condition agreement yet.")
+            continue
+        vals = list(ratios.values())
+        agree = all(v < 1 for v in vals) or all(v >= 1 for v in vals)
+        summary.append(f"\n{model}: " + ", ".join(f"{c}={r:.3f}" for c, r in ratios.items())
+                      + f"  {'AGREE (both same side of 1)' if agree else 'DISAGREE across conditions'}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True, help="path to the results/ folder pulled off the pod")
     ap.add_argument("--out", default="figures", help="where to write figures + summary")
+    ap.add_argument("--config", default="config.yaml")
     args = ap.parse_args()
 
     results = Path(args.results)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
 
-    # tolerate being pointed either at results/ or its parent
-    if not (results / "olmoe").exists() and (results / "results" / "olmoe").exists():
+    if not any((results / d).is_dir() for d in ("token_capped", "aligned")) \
+       and (results / "results").exists():
         results = results / "results"
 
-    # Detect the NEW multi-condition/multi-seed layout
-    # (results/<condition>/seed<N>/<model>/...) and refuse rather than
-    # silently misread it. These analysis scripts still expect the OLD
-    # single-condition layout (results/<model>/...); they are being reworked
-    # for the new layout AFTER the multi-condition pod run. To analyze new
-    # results, point --results at one specific cell, e.g.
-    # ./results-from-runpod/token_capped/seed42
-    if (results / "token_capped").exists() or (results / "aligned").exists():
-        raise SystemExit(
-            "This looks like the NEW multi-condition layout "
-            "(results/<condition>/seed<N>/<model>/).\n"
-            "These analysis scripts currently expect the OLD single-condition "
-            "layout (results/<model>/) and are being reworked for the new one.\n"
-            "For now, point --results at ONE cell, e.g.:\n"
-            f"  --results {results}/token_capped/seed42\n"
-        )
+    config = load_config(args.config)
+    lang_meta = language_metadata(config)
+    pairs = script_pairs(config)
+    order = display_order(lang_meta)
 
-    missing = [m for m in MODELS if not (results / m / "03_analysis" / "jsd_by_layer.json").exists()]
-    if missing:
-        raise SystemExit(f"Missing analysis outputs for: {missing}\n"
-                         f"Looked under {results.resolve()}. Point --results at the folder "
-                         f"containing olmoe/ qwen_moe/ deepseek_moe/.")
+    conditions, seeds, models = discover_matrix(results)
+    if not models:
+        raise SystemExit(f"No (condition/seed/model) cells with content found under {results.resolve()}. "
+                         f"Expected results/<condition>/seed<N>/<model>/...")
+    print(f"Discovered: conditions={conditions} seeds={seeds} models={models}")
 
-    summary = []
-    for model in MODELS:
-        lang_order, hard, soft, layers = load_jsd(results, model)
-        mean = hard.mean(axis=0)
-        fig_heatmap(mean, lang_order, model, out)
-        fig_dendrogram(mean, lang_order, model, out)
-        fig_layerwise(hard, lang_order, layers, model, out)
+    analyzed_cells = [(c, s, m, d) for c, s, m, d in find_cells(results)
+                      if cell_has_analysis(d)]
+    if not analyzed_cells:
+        raise SystemExit(f"No cell under {results.resolve()} has valid analysis artifacts yet. "
+                         f"Run analyse_all.sh first.")
+    missing_analysis = [(c, s, m) for c, s, m, d in find_cells(results) if not cell_has_analysis(d)]
+    if missing_analysis:
+        print(f"NOTE: {len(missing_analysis)} cell(s) still lack analysis and will be skipped: "
+             f"{missing_analysis[:10]}{' ...' if len(missing_analysis) > 10 else ''}")
 
-    hu_df = hindi_urdu_analysis(results, summary)
-    fig_hindi_urdu(hu_df, out)
-    family_clustering_score(results, summary)
-    significance_summary(results, summary)
-    ablation_analysis(results, summary, out)
+    summary = [f"Discovered matrix: conditions={conditions} seeds={seeds} models={models}"]
+
+    for model in models:
+        for condition in conditions:
+            agg = aggregate_condition_jsd(results, model, condition, seeds)
+            if agg is None:
+                continue
+            lang_order, mean_mat, spread_mat, per_seed_hard, layers = agg
+            fig_heatmap(mean_mat, lang_order, model, condition, order, out)
+            fig_dendrogram(mean_mat, lang_order, model, condition, order, out)
+            fig_layerwise(per_seed_hard, lang_order, layers, model, condition, lang_meta, order, out)
+            max_spread = spread_mat.max()
+            summary.append(f"\n{model} [{condition}]: max pairwise seed-spread in mean-JSD = {max_spread:.4f}"
+                          + (f" (n_seeds={len(per_seed_hard)})" if len(per_seed_hard) > 1 else " (only 1 seed present)"))
+
+    pair_df = script_pair_analysis(results, models, conditions, seeds, lang_meta, pairs, summary)
+    fig_script_pair_controls(pair_df, out)
+    family_clustering_score(results, models, conditions, seeds, lang_meta, summary)
+    condition_agreement_summary(results, models, conditions, seeds, lang_meta, summary)
+    significance_summary(results, models, conditions, seeds, summary)
+    ablation_analysis(results, models, conditions, seeds, lang_meta, summary, out)
 
     text = "\n".join(summary)
     (out / "findings_summary.txt").write_text(text, encoding="utf-8")

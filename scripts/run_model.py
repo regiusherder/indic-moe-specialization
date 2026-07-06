@@ -35,6 +35,10 @@ def main():
     parser.add_argument("--model", required=True, choices=["olmoe", "qwen_moe", "deepseek_moe"])
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--results-dir", default=None, help="override output.results_dir from config")
+    parser.add_argument("--phase", default="full", choices=["extract", "ablate", "full"],
+                        help="GPU phase: 'extract' (routing only, stop before analysis), "
+                             "'ablate' (needs extraction + laptop-produced analysis present), "
+                             "'full' (extract+analysis+ablation on one box). Default: full.")
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -67,7 +71,7 @@ def main():
     sys.stderr = Tee(sys.__stderr__, log_file)
 
     try:
-        run_model_pipeline(args.model, config, config_path, results_root)
+        run_model_pipeline(args.model, config, config_path, results_root, phase=args.phase)
     except Exception:
         print(f"\n{'!'*70}\nFATAL ERROR in {args.model} pipeline — full traceback below.\n"
               f"Re-running this command will resume from the last completed checkpoint\n"

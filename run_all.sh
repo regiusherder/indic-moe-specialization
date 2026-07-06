@@ -1,31 +1,37 @@
 #!/usr/bin/env bash
-# Single entrypoint for the whole study on a rented GPU pod (RunPod/Lambda).
-# Run this ONCE inside a tmux/screen session and walk away:
+# GPU entrypoint for the study on a rented GPU pod (RunPod/Lambda). This does
+# ONLY the GPU-bound work and splits it into two phases around the CPU-bound
+# analysis, which you run OFF the pod (on a laptop) via analyse_all.sh:
 #
-#   tmux new -s indic-moe
-#   bash run_all.sh
-#   # Ctrl+B, D to detach; `tmux attach -t indic-moe` to check back in later
+#   ┌ pod instance A ─────────────┐   ┌ laptop ──────────┐   ┌ pod instance B ─┐
+#   │ bash run_all.sh             │   │ bash analyse_all │   │ bash run_all.sh │
+#   │  -> extraction (GPU)        │ → │  -> analysis     │ → │  -> ablation    │
+#   │  -> stops (analysis not     │   │  (CPU, parallel, │   │  (GPU; sees     │
+#   │     ready) OR ablates if    │   │   free)          │   │   analysis      │
+#   │     analysis already present│   │                  │   │   present)      │
+#   └─────────────────────────────┘   └──────────────────┘   └─────────────────┘
 #
-# What this script does, in order, so nothing needs a second manual step:
-#   1. Sanity-checks: GPU present, not accidentally running on a quota-limited
-#      network volume, enough free disk for all three models + FLORES + results
-#   2. Installs dependencies
-#   3. Pre-fetches all three models' weights via scripts/prefetch_model.py,
-#      which downloads files with plain curl subprocesses rather than
-#      huggingface_hub's own downloader. On 2026-07-03, huggingface_hub's
-#      downloader (both its xet backend and its standard HTTP backend) hung
-#      indefinitely with no exception on TWO different models' first shard,
-#      while curl to the identical URLs succeeded — so this bypasses
-#      huggingface_hub's download machinery entirely and builds the local
-#      HF cache directory by hand (see prefetch_model.py's docstring for
-#      exactly how). Each file download runs under a hard timeout + retry,
-#      so a stuck transfer gets killed and resumed rather than hanging
-#      forever with nobody watching.
-#   4. Runs the actual pipeline (olmoe -> qwen_moe -> deepseek_moe)
+# One command, run the SAME way on both pod instances. It figures out what to do
+# from the results/ tree:
+#   * Extraction not finished for the whole matrix  -> run extraction, then stop
+#     (or, if extraction just completed AND analysis is somehow already present,
+#     fall through to ablation).
+#   * Extraction done + analysis present for all     -> run ablation.
+#   * Extraction done + analysis NOT present          -> stop and tell you to run
+#     analyse_all.sh on the laptop, then re-run this on a fresh pod.
 #
-# Does NOT use Docker by default (faster to iterate on a rented pod that
-# already has CUDA/drivers set up) — use the Dockerfile instead if you want
-# full OS-level reproducibility beyond just the Python environment.
+# Between the two pod instances you must move results/ off the pod, analyze on
+# the laptop, and move it back (the pod's local disk does not persist):
+#   pod A done:  scp -r <pod>:$(pwd)/results ./results-from-pod
+#   laptop:      bash analyse_all.sh ./results-from-pod
+#   pod B:       scp -r ./results-from-pod <podB>:$(pwd)/results  (before run_all.sh)
+#
+# Run inside tmux and walk away:
+#   tmux new -s indic-moe ; bash run_all.sh    # Ctrl+B,D to detach
+#
+# Steps 1-3 (env checks, deps, model prefetch) are identical to before; only the
+# final execution step is phase-aware. Extraction needs the models loaded; the
+# ablation phase does too, so we prefetch in both cases.
 
 set -euo pipefail
 
@@ -133,13 +139,70 @@ export HF_HUB_OFFLINE=1
 echo "HF_HUB_OFFLINE=1 set — pipeline will only read from the cache prefetch just populated."
 
 echo ""
-echo "=== [4/4] Running full pipeline ==="
-echo "    Each model (olmoe -> qwen_moe -> deepseek_moe) is loaded ONCE and run"
-echo "    across the full matrix: 2 sampling conditions (token_capped, aligned)"
-echo "    x 2 seeds. Results land in results/<condition>/seed<N>/<model>/."
-echo "    Extraction is fast; the expensive step (model download) already happened."
-python3 scripts/run_all_models.py
+echo "=== [4/4] GPU pipeline (phase-aware) ==="
+echo "    Current state of results/:"
+python3 scripts/check_phase_ready.py status results || true
+
+# Decide the phase from the results tree.
+#   - If analysis is already present for every extracted cell AND every cell is
+#     extracted, there's nothing left for extraction to do -> go straight to
+#     ablation.
+#   - Otherwise run extraction (idempotent: cells already extracted are skipped),
+#     then re-check: if analysis is now present for all, ablate; else stop.
+run_ablation_if_ready () {
+    if python3 scripts/check_phase_ready.py analysis-all results; then
+        echo ""
+        echo "=== Analysis present for all extracted cells -> running ABLATION phase (GPU) ==="
+        python3 scripts/run_all_models.py --phase ablate
+        echo ""
+        echo "=== Ablation complete. Full results in ./results/. ==="
+        python3 scripts/check_phase_ready.py status results || true
+        return 0
+    fi
+    return 1
+}
+
+if python3 scripts/check_phase_ready.py extracted-all results; then
+    echo ""
+    echo "All cells already extracted — skipping extraction phase."
+    if run_ablation_if_ready; then
+        exit 0
+    fi
+    echo ""
+    echo "############################################################################"
+    echo "# Extraction is done, but ANALYSIS is not present for all cells yet.        #"
+    echo "# Next step (OFF the pod, e.g. on your laptop):                             #"
+    echo "#   1. Sync results/ down:   scp -r <pod>:$(pwd)/results ./results-from-pod #"
+    echo "#   2. Run analysis:         bash analyse_all.sh ./results-from-pod         #"
+    echo "#   3. Sync results/ back to a fresh pod, then run:  bash run_all.sh        #"
+    echo "############################################################################"
+    exit 0
+fi
 
 echo ""
-echo "=== Done. Results in ./results/ — sync this directory off the pod before terminating it. ==="
-echo "    Example: scp -r <pod-user>@<pod-host>:$(pwd)/results ./results-from-runpod"
+echo "=== Running EXTRACTION phase (GPU): routing capture only, stops before analysis ==="
+echo "    olmoe -> qwen_moe -> deepseek_moe, each loaded once across the matrix:"
+echo "    2 conditions (token_capped, aligned) x 2 seeds. Cells already extracted"
+echo "    are skipped. Results land in results/<condition>/seed<N>/<model>/02_routing_raw/."
+python3 scripts/run_all_models.py --phase extract
+
+echo ""
+echo "=== Extraction phase finished. ==="
+python3 scripts/check_phase_ready.py status results || true
+
+# It's possible (e.g. a resumed pod that already carried analysis back) that
+# analysis is present for everything now; if so, ablate in the same run.
+if run_ablation_if_ready; then
+    exit 0
+fi
+
+echo ""
+echo "############################################################################"
+echo "# EXTRACTION DONE. Analysis (CPU) is next and runs OFF the pod:             #"
+echo "#   1. Sync results/ down:   scp -r <pod>:$(pwd)/results ./results-from-pod #"
+echo "#   2. On the laptop:        bash analyse_all.sh ./results-from-pod         #"
+echo "#   3. Sync results/ back to a fresh pod and run again:  bash run_all.sh    #"
+echo "#      (it will detect analysis is present and run the ablation phase)      #"
+echo "#                                                                           #"
+echo "# You can terminate THIS pod now to stop paying for the GPU during analysis.#"
+echo "############################################################################"

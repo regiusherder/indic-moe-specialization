@@ -26,6 +26,7 @@ import pandas as pd
 # so the pipeline can be imported and mock-tested without torch installed.
 
 from . import routing as routing_mod
+from .analysis import analysis_artifacts_valid, load_records, run_analysis
 from .ablation import run_ablation_study
 from .data import (build_aligned_sample, build_token_capped_sample,
                    download_flores, load_language_sentences)
@@ -162,53 +163,27 @@ def _extract_routing(adapter, samples, extraction_dir):
     return records
 
 
-def _run_analysis(records, adapter, config, analysis_dir, rng):
+def _run_analysis(routing_dir, adapter, config, analysis_dir, seed, n_workers=None):
     """Stage 4: per-layer hard+soft JSD, sentence+token permutation tests,
-    bootstrap CIs. Idempotent via artifact presence + schema check."""
-    layers_present = sorted(next(iter(records.values())).per_sentence_selected.keys())
-    artifacts = [analysis_dir / "jsd_by_layer.json",
-                 analysis_dir / "permutation_tests.csv",
-                 analysis_dir / "bootstrap_cis.csv"]
-    if all(p.exists() for p in artifacts):
-        existing = json.loads((analysis_dir / "jsd_by_layer.json").read_text(encoding="utf-8"))
-        if "matrix_hard" in next(iter(existing.values()), {}):
-            return layers_present
+    bootstrap CIs. Delegates to the shared, layer-parallel, torch-free core in
+    src/analysis.py so the identical computation can also run standalone on a
+    laptop (scripts/run_analysis.py / analyse_all.sh) from the extracted .pkl
+    files. Passes the ROUTING DIR (not in-memory records) so the parallel path's
+    workers reload from disk instead of each holding a full pickled copy.
 
-    import time
-    from tqdm import tqdm
-    jsd_by_layer, permtest_rows, bootstrap_rows = {}, [], []
-    n_perms = config["routing"]["permutation_test"]["n_permutations"]
-    n_boot = config["routing"]["bootstrap"]["n_resamples"]
-    ne = adapter.num_routed_experts
-    n_pairs = len(layers_present) * len(records) * (len(records) - 1) // 2
-    print(f"    analysis: {len(layers_present)} layers x {len(records)*(len(records)-1)//2} "
-          f"language pairs = {n_pairs} pairwise tests "
-          f"({n_perms} perms + {n_boot} bootstrap each). CPU-bound.")
-    t0 = time.time()
-
-    for layer_idx in tqdm(layers_present, desc="    analysis (per layer)", unit="layer"):
-        mh, lang_order = routing_mod.pairwise_jsd_matrix(records, layer_idx, ne, metric="hard")
-        ms, _ = routing_mod.pairwise_jsd_matrix(records, layer_idx, ne, metric="soft")
-        jsd_by_layer[layer_idx] = {"matrix_hard": mh.tolist(), "matrix_soft": ms.tolist(),
-                                   "lang_order": lang_order}
-        for i, a in enumerate(lang_order):
-            for j, b in enumerate(lang_order):
-                if i >= j:
-                    continue
-                sa = records[a].per_sentence_selected[layer_idx]
-                sb = records[b].per_sentence_selected[layer_idx]
-                pt_sent = routing_mod.permutation_test_sentences(sa, sb, ne, n_perms, rng)
-                permtest_rows.append({"layer": layer_idx, "lang_a": a, "lang_b": b, "unit": "sentence", **pt_sent})
-                pt_tok = routing_mod.permutation_test(np.concatenate(sa, 0), np.concatenate(sb, 0), ne, n_perms, rng)
-                permtest_rows.append({"layer": layer_idx, "lang_a": a, "lang_b": b, "unit": "token", **pt_tok})
-                bt = routing_mod.bootstrap_jsd_ci(records[a], records[b], layer_idx, ne, n_boot, rng)
-                bootstrap_rows.append({"layer": layer_idx, "lang_a": a, "lang_b": b, **bt})
-
-    (analysis_dir / "jsd_by_layer.json").write_text(json.dumps(jsd_by_layer, indent=2), encoding="utf-8")
-    pd.DataFrame(permtest_rows).to_csv(analysis_dir / "permutation_tests.csv", index=False)
-    pd.DataFrame(bootstrap_rows).to_csv(analysis_dir / "bootstrap_cis.csv", index=False)
-    print(f"    analysis done in {(time.time()-t0)/60:.1f}min")
-    return layers_present
+    Parallelizing across the independent layers is the single biggest speedup in
+    the pipeline: this stage was ~half of every cell's wall-clock and was
+    single-threaded.
+    """
+    return run_analysis(
+        routing_dir,
+        n_experts=adapter.num_routed_experts,
+        n_perms=config["routing"]["permutation_test"]["n_permutations"],
+        n_boot=config["routing"]["bootstrap"]["n_resamples"],
+        analysis_dir=analysis_dir,
+        base_seed=seed,
+        n_workers=n_workers,
+    )
 
 
 def _run_ablation(records, samples, adapter, config, layers_present, ablation_dir, rng):
@@ -237,15 +212,47 @@ def _run_ablation(records, samples, adapter, config, layers_present, ablation_di
     pd.DataFrame(rows).to_csv(ablation_csv, index=False)
 
 
-def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_root: Path):
-    """Load the model once, then run every (sampling condition, seed) cell."""
+# ---- checkpoint stages, in order ----
+# The pipeline is split into GPU phases so the CPU-bound analysis can run
+# elsewhere (a laptop) between them. A cell's _checkpoint.json "stage" records
+# how far it has progressed:
+#   "extracted" -> 02_routing_raw/*.pkl written; analysis + ablation still owed.
+#   "complete"  -> ablation done too (04_ablation/ablation_results.csv present).
+# Analysis (03_analysis/) is tracked by its own artifacts, NOT the checkpoint,
+# because it may be produced on a different machine than the one that wrote the
+# checkpoint. `phase` selects which GPU work this invocation performs:
+#   "extract" -> only extraction (stop before analysis/ablation)
+#   "ablate"  -> only ablation; REQUIRES extraction done AND analysis present
+#   "full"    -> extract, analysis (inline), ablation — the all-on-one-box path
+STAGE_EXTRACTED = "extracted"
+STAGE_COMPLETE = "complete"
+
+
+def _read_stage(ck_path: Path):
+    if not ck_path.exists():
+        return None
+    try:
+        return json.loads(ck_path.read_text()).get("stage")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def run_model_pipeline(model_key: str, config: dict, config_path: Path,
+                       results_root: Path, phase: str = "full"):
+    """Run one model across the (condition x seed) matrix for the given GPU phase.
+
+    phase="extract": extraction only (GPU). Writes .pkl, checkpoints "extracted".
+    phase="ablate" : ablation only (GPU). Requires each cell to be "extracted"
+                     AND to have valid analysis artifacts (produced on the laptop
+                     via analyse_all.sh). Checkpoints "complete".
+    phase="full"   : extract -> analysis (inline) -> ablation on one box (old
+                     behavior; use when you have a single GPU machine and don't
+                     want to offload analysis).
+    """
+    if phase not in ("extract", "ablate", "full"):
+        raise ValueError(f"phase must be extract|ablate|full, got {phase!r}")
     model_cfg = config["models"][model_key]
 
-    # ---- data (once) ----
-    cache_dir = results_root / "_flores_cache"
-    flores_dir, flores_sha256 = download_flores(cache_dir, config["data"]["flores_url"], config["data"]["flores_sha256"])
-
-    # ---- top-level completion guard across the WHOLE matrix for this model ----
     conditions = config["data"]["sampling_conditions"]
     seeds = config["seeds"]
     cells = [(c, s) for c in conditions for s in seeds]
@@ -253,68 +260,140 @@ def run_model_pipeline(model_key: str, config: dict, config_path: Path, results_
     def cell_dir(cond, seed):
         return results_root / cond / f"seed{seed}" / model_key
 
-    if all((cell_dir(c, s) / "_checkpoint.json").exists()
-           and json.loads((cell_dir(c, s) / "_checkpoint.json").read_text()).get("stage") == "complete"
-           for c, s in cells):
-        print(f"{model_key}: all {len(cells)} cells already complete — skipping, no model load.")
+    # ---- fast exits that avoid loading the model at all ----
+    # Determine, per cell, what THIS phase still needs to do; if nothing, skip
+    # the (expensive) model load entirely.
+    def cell_needs_work(cond, seed):
+        d = cell_dir(cond, seed)
+        stage = _read_stage(d / "_checkpoint.json")
+        if phase == "extract":
+            return stage not in (STAGE_EXTRACTED, STAGE_COMPLETE)
+        if phase == "full":
+            return stage != STAGE_COMPLETE
+        if phase == "ablate":
+            if stage == STAGE_COMPLETE:
+                return False
+            # ablate needs to run here; whether it CAN is checked later (needs
+            # extraction + analysis). Returning True means "load model and try".
+            return True
+        return True
+
+    if not any(cell_needs_work(c, s) for c, s in cells):
+        print(f"{model_key}: nothing to do for phase='{phase}' — all cells satisfied. No model load.")
         return
+
+    # ---- data (once) ----
+    cache_dir = results_root / "_flores_cache"
+    flores_dir, flores_sha256 = download_flores(
+        cache_dir, config["data"]["flores_url"], config["data"]["flores_sha256"])
 
     # ---- model (once) ----
     adapter = _adapter_for(model_cfg["adapter"])
     adapter.knockout = config["ablation"]["knockout"]
-    print(f"Loading {model_cfg['hf_id']} ...")
+    print(f"Loading {model_cfg['hf_id']} (phase={phase}) ...")
     adapter.load(model_cfg["hf_id"], model_cfg.get("revision"), model_cfg["quantization"])
     print(f"Loaded. layers={adapter.num_layers} routed_experts={adapter.num_routed_experts} "
           f"top_k={adapter.top_k} shared_experts={adapter.n_shared_experts} "
           f"knockout={adapter.knockout} resolved_revision={getattr(adapter, 'resolved_revision', 'n/a')}")
 
     for cond_name, cond_cfg in conditions.items():
-        # samples depend only on (condition, model tokenizer) — build once per condition
-        samples = None
+        samples = None  # built lazily, and only if some cell in this condition needs GPU work
+
+        def ensure_samples(_samples):
+            if _samples is not None:
+                return _samples
+            print("  building samples ...")
+            s = _build_samples(config, adapter, flores_dir, cond_name, cond_cfg)
+            cond_samples_path = results_root / cond_name / "01_samples.json"
+            cond_samples_path.parent.mkdir(parents=True, exist_ok=True)
+            cond_samples_path.write_text(json.dumps(
+                {l: {k: v for k, v in si.items() if k != "sentences"} | {"n_sentences": si["n_sentences"]}
+                 for l, si in s.items()}, indent=2, ensure_ascii=False), encoding="utf-8")
+            return s
+
         for seed in seeds:
             out_dir = cell_dir(cond_name, seed)
             out_dir.mkdir(parents=True, exist_ok=True)
             ck = out_dir / "_checkpoint.json"
-            if ck.exists() and json.loads(ck.read_text()).get("stage") == "complete" \
-               and (out_dir / "04_ablation" / "ablation_results.csv").exists():
-                print(f"[{cond_name}/seed{seed}/{model_key}] complete — skipping.")
+            stage = _read_stage(ck)
+            tag = f"[{cond_name}/seed{seed}/{model_key}]"
+
+            extraction_dir = out_dir / "02_routing_raw"
+            analysis_dir = out_dir / "03_analysis"
+            ablation_dir = out_dir / "04_ablation"
+
+            if stage == STAGE_COMPLETE and (ablation_dir / "ablation_results.csv").exists():
+                print(f"{tag} complete — skipping.")
                 continue
 
-            print(f"\n{'='*70}\n{model_key} | condition={cond_name} | seed={seed}\n{'='*70}")
-            write_manifest(out_dir, config, config_path, extra={
-                "model_key": model_key, "sampling_condition": cond_name, "seed": seed,
-                "flores_sha256": flores_sha256, "knockout": adapter.knockout,
-                "resolved_revision": getattr(adapter, "resolved_revision", None),
-            })
+            print(f"\n{'='*70}\n{model_key} | condition={cond_name} | seed={seed} | phase={phase}\n{'='*70}")
 
-            if samples is None:
-                print("  building samples ...")
-                samples = _build_samples(config, adapter, flores_dir, cond_name, cond_cfg)
-                # persist the sampled sentences (once per condition; identical across seeds)
-                cond_samples_path = results_root / cond_name / "01_samples.json"
-                cond_samples_path.parent.mkdir(parents=True, exist_ok=True)
-                cond_samples_path.write_text(json.dumps(
-                    {l: {k: v for k, v in s.items() if k != "sentences"} | {"n_sentences": s["n_sentences"]}
-                     for l, s in samples.items()}, indent=2, ensure_ascii=False), encoding="utf-8")
+            # ============ EXTRACTION ============
+            # Run if this cell isn't at least 'extracted', for extract/full phases.
+            need_extract = stage not in (STAGE_EXTRACTED, STAGE_COMPLETE)
+            if phase in ("extract", "full") and need_extract:
+                write_manifest(out_dir, config, config_path, extra={
+                    "model_key": model_key, "sampling_condition": cond_name, "seed": seed,
+                    "flores_sha256": flores_sha256, "knockout": adapter.knockout,
+                    "resolved_revision": getattr(adapter, "resolved_revision", None),
+                    "phase_extract": True,
+                })
+                samples = ensure_samples(samples)
+                hooks = adapter.register_hooks()
+                extraction_dir.mkdir(exist_ok=True)
+                _extract_routing(adapter, samples, extraction_dir)
+                for h in hooks:
+                    h.remove()
+                ck.write_text(json.dumps({
+                    "stage": STAGE_EXTRACTED,
+                    "gate_output_format": getattr(adapter, "gate_output_format", "n/a"),
+                    "knockout": adapter.knockout,
+                }))
+                stage = STAGE_EXTRACTED
+                print(f"{tag} extraction done.")
 
-            hooks = adapter.register_hooks()
-            extraction_dir = out_dir / "02_routing_raw"; extraction_dir.mkdir(exist_ok=True)
-            records = _extract_routing(adapter, samples, extraction_dir)
-            for h in hooks:
-                h.remove()
+            if phase == "extract":
+                # GPU-only extract phase stops here; analysis+ablation happen later.
+                continue
 
-            analysis_dir = out_dir / "03_analysis"; analysis_dir.mkdir(exist_ok=True)
-            layers_present = _run_analysis(records, adapter, config, analysis_dir, np.random.default_rng(seed))
+            # From here we need the records in memory (for full's inline analysis
+            # and for ablation's expert targeting). They must exist on disk.
+            if not (extraction_dir.exists() and any(extraction_dir.glob("*.pkl"))):
+                if phase == "ablate":
+                    print(f"{tag} SKIP: no extracted routing (.pkl) found — run the extract "
+                          f"phase (run_all.sh) first.")
+                    continue
+                raise RuntimeError(f"{tag}: extraction produced no .pkl files.")
 
-            ablation_dir = out_dir / "04_ablation"; ablation_dir.mkdir(exist_ok=True)
+            # ============ ANALYSIS ============
+            if phase == "full":
+                samples = ensure_samples(samples)
+                analysis_dir.mkdir(exist_ok=True)
+                _run_analysis(
+                    extraction_dir, adapter, config, analysis_dir, seed,
+                    n_workers=config.get("analysis", {}).get("n_workers"))
+            else:  # phase == "ablate": analysis MUST already be present (laptop-produced)
+                if not analysis_artifacts_valid(analysis_dir):
+                    print(f"{tag} SKIP ablation: analysis artifacts missing/stale in "
+                          f"{analysis_dir}. Run analyse_all.sh on the laptop and sync results "
+                          f"back before the ablate phase.")
+                    continue
+                samples = ensure_samples(samples)
+
+            # ============ ABLATION ============
+            # load records from disk (works for both full and ablate; the ablate
+            # phase may run on a fresh box that never held them in memory).
+            records = load_records(extraction_dir)
+            layers_present = sorted(next(iter(records.values())).per_sentence_selected.keys())
+            ablation_dir.mkdir(exist_ok=True)
             _run_ablation(records, samples, adapter, config, layers_present, ablation_dir,
                           np.random.default_rng(seed + 1))
 
             ck.write_text(json.dumps({
-                "stage": "complete",
+                "stage": STAGE_COMPLETE,
                 "gate_output_format": getattr(adapter, "gate_output_format", "n/a"),
                 "knockout": adapter.knockout,
             }))
-            print(f"[{cond_name}/seed{seed}/{model_key}] complete.")
+            print(f"{tag} complete.")
 
-    print(f"\n{model_key}: all cells complete.")
+    print(f"\n{model_key}: phase='{phase}' finished.")
